@@ -28,18 +28,19 @@ class KVmemNN(nn.Module):
         self.shared_emb = nn.Embedding(num_embeddings=vocab_size,
                                        embedding_dim=embedding_size,
                                        sparse=True)
-        dialogs_df = pd.read_csv('/home/arms/research/ParlAI/parlai/agents/arms/dialog.csv')
+        dialogs_df = pd.read_csv('/home/arms/dialog.csv')
         print(dialogs_df.head())
 
+        sampled_df = dialogs_df.sample(1000)
         self.keys = []
-        for key in dialogs_df['keys']:
+        for key in sampled_df['keys']:
             key_vec = vocs.txt2vec(key)
             key_vec = torch.tensor(key_vec, dtype=torch.long)
             self.keys.append(key_vec)
             #self.encoded_keys.append(self.shared_emb(key_vec))
 
         self.values = []
-        for value in dialogs_df['values']:
+        for value in sampled_df['values']:
             value_vec = vocs.txt2vec(value)
             value_vec = torch.tensor(value_vec, dtype=torch.long)
             self.values.append(value_vec)
