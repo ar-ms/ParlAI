@@ -14,9 +14,10 @@ from parlai.scripts.train_model import setup_args, TrainLoop
 if __name__ == '__main__':
     parser = setup_args()
     parser.set_defaults(
-        task='convai2:self_revised',
+        task='convai2:self_original',
         evaltask='convai2:self',
-        model='projects.personachat.kvmemnn.kvmemnn:KvmemnnAgent',
+        #model='projects.personachat.kvmemnn.kvmemnn:KvmemnnAgent',
+        model='projects.personachat.kvmemnn.arms:ArmsAgent',
         model_file='/tmp/persona_self_rephrase',
         dict_lower=True,
         dict_include_valid=True,
@@ -36,6 +37,6 @@ if __name__ == '__main__':
         validation_patience=-1,
         validation_max_examples=100000,
         log_every_n_secs=10,
-        numthreads=40,
+        numthreads=5,
     )
     TrainLoop(parser.parse_args()).train()
