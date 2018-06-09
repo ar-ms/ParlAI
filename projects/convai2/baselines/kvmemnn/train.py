@@ -7,15 +7,17 @@
 These parameters have some variance in their final perplexity, but they were
 used to achieve the pre-trained model.
 """
-
+import torch
 from parlai.scripts.train_model import setup_args, TrainLoop
 
 
 if __name__ == '__main__':
+    torch.multiprocessing.set_start_method("spawn")
     parser = setup_args()
     parser.set_defaults(
         task='convai2:self',
         evaltask='convai2:self',
+        no_cuda=False,
         #model='projects.personachat.kvmemnn.kvmemnn:KvmemnnAgent',
         model='projects.personachat.kvmemnn.arms:ArmsAgent',
         model_file='/tmp/persona_self_original',
@@ -33,13 +35,13 @@ if __name__ == '__main__':
         tfidf=False,
         max_train_time=28800,
         save_every_n_secs=500,
-        display_examples=True,
+        display_examples=False,
         validation_every_n_secs=1000,
         validation_metric='accuracy',
         validation_metric_mode='max',
         validation_patience=-1,
-        validation_max_examples=1,
+        validation_max_examples=10,
         log_every_n_secs=10,
-        numthreads=1,
+        numthreads=2,
     )
     TrainLoop(parser.parse_args()).train()

@@ -19,6 +19,7 @@ import copy
 import pickle
 import pandas as pd
 
+
 def load_cands(path):
     """Load global fixed set of candidate labels that the teacher provides
     every example (the true labels for a specific example are also added to
@@ -65,23 +66,23 @@ class KVmemNN(nn.Module):
         self.n_hops = n_hops
         self.shared_emb = nn.Embedding(num_embeddings=vocab_size,
                                        embedding_dim=embedding_size,
-                                       sparse=True)
-        dialogs_df = pd.read_csv('/home/arms/research/dialog.csv')
+                                       sparse=True).cuda()
+        dialogs_df = pd.read_csv('/home/arms/dialog.csv')
 
         sampled_df = dialogs_df.sample(5000)
         self.keys = []
         self.values = []
         for i, el in sampled_df.iterrows():
             key_vec = vocs.txt2vec(el['keys'])
-            key_vec = torch.tensor(key_vec, dtype=torch.long)
+            key_vec = torch.tensor(key_vec, dtype=torch.long).cuda()
             self.keys.append(key_vec)
             value_vec = vocs.txt2vec(el['values'])
-            value_vec = torch.tensor(value_vec, dtype=torch.long)
+            value_vec = torch.tensor(value_vec, dtype=torch.long).cuda()
             self.values.append(value_vec)
         
-        self.softmax = nn.Softmax(dim=0)
-        self.cosine = nn.CosineSimilarity(dim=1, eps=1e-6)
-        self.R = nn.Linear(embedding_size, embedding_size, bias=False)
+        self.softmax = nn.Softmax(dim=0).cuda()
+        self.cosine = nn.CosineSimilarity(dim=1, eps=1e-6).cuda()
+        self.R = nn.Linear(embedding_size, embedding_size, bias=False).cuda()
 
     def forward(self, xs, candidates, persona, label):
         """
@@ -100,16 +101,16 @@ class KVmemNN(nn.Module):
 
         encoded_candidates = []
         for cand in candidates:
-            cand = torch.tensor(cand, dtype=torch.long)
+            cand = torch.tensor(cand, dtype=torch.long).cuda()
             encoded_candidates.append(self.shared_emb(cand).mean(0))
             
         encoded_persona = []
         encoded_xs = []
         for p in persona:
-            p = torch.tensor(p, dtype=torch.long)
+            p = torch.tensor(p, dtype=torch.long).cuda()
             encoded_persona.append(self.shared_emb(p).mean(0))
 
-            x = torch.tensor(xs, dtype=torch.long)
+            x = torch.tensor(xs, dtype=torch.long).cuda()
             encoded_xs.append(self.shared_emb(x).mean(1))
 
         encoded_keys = torch.stack(encoded_keys)
@@ -118,7 +119,7 @@ class KVmemNN(nn.Module):
         encoded_persona = torch.stack(encoded_persona)
         encoded_questions = torch.stack(encoded_xs).view(-1, self.embedding_size)
 
-        x = torch.tensor(xs, dtype=torch.long)
+        x = torch.tensor(xs, dtype=torch.long).cuda()
         encoded_question = self.shared_emb(x).mean(1).view(-1, self.embedding_size)
         q = encoded_question
 
@@ -198,36 +199,36 @@ class ArmsAgent(Agent):
             self.model = KVmemNN(self.dict, emb_size)
             print(self.model.parameters)
             self.model.share_memory()
+            print('[*] Info: loading dialog file...')
+            all_cands_df = pd.read_csv('/home/arms/dialog.csv')
+            all_cands = all_cands_df['keys'] + all_cands_df['values']
+            self.all_cands = [self.dict.txt2vec(cand) for cand in all_cands]
+            print('[*] Info: cands ready...')
         else:
             # ... copy initialized data from shared table
             self.opt = shared['opt']
             self.dict = shared['dict']
             self.model = shared['model']
-
-        print('[*] Info: loading dialog file...')
-        all_cands_df = pd.read_csv('/home/arms/research/dialog.csv')
-        all_cands = all_cands_df['keys'] + all_cands_df['values']
-        self.all_cands = [self.dict.txt2vec(cand) for cand in all_cands]
-        print('[*] Info: cands ready...')
-
+            self.all_cands = shared['all_cands']
+            
         if hasattr(self, 'model'):
             # we set up a model for original instance and multithreaded ones
             # self.criterion = nn.NLLLoss()
-            self.criterion = nn.CrossEntropyLoss()
+            self.criterion = nn.CrossEntropyLoss().cuda()
             
             # set up optims for each module
             lr = opt['learningrate']
             self.optimizer = optim.SGD(self.model.parameters(), lr=lr)
 
-            # we use END markers to end our output
-            self.END_IDX = self.dict[self.dict.end_token]
-            # get index of null token from dictionary (probably 0)
-            self.NULL_IDX = self.dict[self.dict.null_token]
-            # we use START markers to start our output
-            self.START_IDX = self.dict[self.dict.start_token]
-            self.START = torch.LongTensor([self.START_IDX])
-            if self.use_cuda:
-                self.START = self.START.cuda()
+            # # we use END markers to end our output
+            # self.END_IDX = self.dict[self.dict.end_token]
+            # # get index of null token from dictionary (probably 0)
+            # self.NULL_IDX = self.dict[self.dict.null_token]
+            # # we use START markers to start our output
+            # self.START_IDX = self.dict[self.dict.start_token]
+            # self.START = torch.LongTensor([self.START_IDX])
+            # if self.use_cuda:
+            #     self.START = self.START.cuda()
 
         self.reset()
 
@@ -251,11 +252,8 @@ class ArmsAgent(Agent):
         shared = super().share()
         shared['opt'] = self.opt
         shared['dict'] = self.dict
-
-        if self.opt.get('numthreads', 1) > 1:
-            # we're doing hogwild so share the model too
-            shared['model'] = self.model
-
+        shared['all_cands'] = self.all_cands
+        shared['model'] = self.model
         return shared
 
     def observe(self, observation):
@@ -280,7 +278,7 @@ class ArmsAgent(Agent):
             self.model.train()
             self.zero_grad()
             pred = self.model(xs, cands, persona, ys)
-            loss = self.criterion(pred.view(1, -1), torch.tensor([ys]))
+            loss = self.criterion(pred.view(1, -1), torch.tensor([ys]).cuda())
             loss.backward()
             self.update_params()
             print('argmax: ', pred.argmax())
@@ -298,9 +296,10 @@ class ArmsAgent(Agent):
 
         xs = [self.dict.txt2vec(obs['text'].split('\n')[-1]) for obs in observations]
         if is_training:
-            ys = list(observations[0]['label_candidates']).index(
-                observations[0]['labels'][0])
+            #ys = list(observations[0]['label_candidates']).index(
+            #    observations[0]['labels'][0])
             #ys = [self.dict.txt2vec(obs['labels'][0]) for obs in observations]
+            ys = 19
             cands = [self.dict.txt2vec(cand) for obs in observations
                      for cand in obs['label_candidates']]
         
