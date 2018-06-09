@@ -104,7 +104,10 @@ def run_eval(agent, opt, datatype, max_exs=-1, write_log=False, valid_world=None
         valid_world = create_task(opt, agent)
     valid_world.reset()
     cnt = 0
-    while not valid_world.epoch_done():
+
+    i_example = 0
+    print('== Before valid ==')
+    while not valid_world.epoch_done() and opt['validation_max_examples'] > i_example:
         valid_world.parley()
         if cnt == 0 and opt['display_examples']:
             print(valid_world.display() + '\n~~')
@@ -114,6 +117,7 @@ def run_eval(agent, opt, datatype, max_exs=-1, write_log=False, valid_world=None
             # note this max_exs is approximate--some batches won't always be
             # full depending on the structure of the data
             break
+        i_example += 1
     valid_report = valid_world.report()
     valid_world.reset()  # this makes sure agent doesn't remember valid data
 
@@ -156,6 +160,8 @@ class TrainLoop():
         self.save_time = Timer()
         print('[ training... ]')
         self.parleys = 0
+
+        self.max_val_examples = opt['validation_max_examples'] if opt['validation_max_examples'] > 0 else float('inf')
         self.max_num_epochs = opt['num_epochs'] if opt['num_epochs'] > 0 else float('inf')
         self.max_train_time = opt['max_train_time'] if opt['max_train_time'] > 0 else float('inf')
         self.log_every_n_secs = opt['log_every_n_secs'] if opt['log_every_n_secs'] > 0 else float('inf')
@@ -252,7 +258,7 @@ class TrainLoop():
                     break
                 if self.log_time.time() > self.log_every_n_secs:
                     self.log()
-                if self.validate_time.time() > self.val_every_n_secs:
+                if self.validate_time.time() > self.val_every_n_secs and world.episode_done():
                     stop_training = self.validate()
                     if stop_training:
                         break
@@ -260,6 +266,7 @@ class TrainLoop():
                     print("[ saving model checkpoint: " + opt['model_file'] + ".checkpoint ]")
                     self.agent.save(opt['model_file'] + '.checkpoint')
                     self.save_time.reset()
+
 
         if not self.saved:
             # save agent
