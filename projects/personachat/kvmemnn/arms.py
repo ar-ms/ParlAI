@@ -16,36 +16,68 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import copy
-
+import pickle
 import pandas as pd
+
+def load_cands(path):
+    """Load global fixed set of candidate labels that the teacher provides
+    every example (the true labels for a specific example are also added to
+    this set, so that it's possible to get the right answer).
+    """
+    if path is None:
+        return None
+    cands = []
+    lines_have_ids = False
+    cands_are_replies = False
+    cnt = 0
+    with open(path) as read:
+        for line in read:
+            line = line.strip().replace('\\n', '\n')
+            if len(line) > 0:
+                cnt = cnt + 1
+                # If lines are numbered we strip them of numbers.
+                if cnt == 1 and line[0:2] == '1 ':
+                    lines_have_ids = True
+                # If tabs then the label_candidates are all the replies.
+                if '\t' in line and not cands_are_replies:
+                    cands_are_replies = True
+                    cands = []
+                if lines_have_ids:
+                    space_idx = line.find(' ')
+                    line = line[space_idx + 1:]
+                    if cands_are_replies:
+                        sp = line.split('\t')
+                        if len(sp) > 1 and sp[1] != '':
+                            cands.append(sp[1])
+                    else:
+                        cands.append(line)
+                else:
+                    cands.append(line)
+    return cands
 
 class KVmemNN(nn.Module):
     def __init__(self, vocs, embedding_size=100, n_hops=2):
         super(KVmemNN, self).__init__()
 
+        #print(len(load_cands('/home/arms/research/ParlAI/data/ConvAI2/train_self_original.txt')))
+        self.embedding_size = embedding_size
         vocab_size = len(vocs)
         self.n_hops = n_hops
         self.shared_emb = nn.Embedding(num_embeddings=vocab_size,
                                        embedding_dim=embedding_size,
                                        sparse=True)
-        dialogs_df = pd.read_csv('/home/arms/dialog.csv')
-        print(dialogs_df.head())
+        dialogs_df = pd.read_csv('/home/arms/research/dialog.csv')
 
-        sampled_df = dialogs_df.sample(1000)
+        sampled_df = dialogs_df.sample(5000)
         self.keys = []
-        for key in sampled_df['keys']:
-            key_vec = vocs.txt2vec(key)
+        self.values = []
+        for i, el in sampled_df.iterrows():
+            key_vec = vocs.txt2vec(el['keys'])
             key_vec = torch.tensor(key_vec, dtype=torch.long)
             self.keys.append(key_vec)
-            #self.encoded_keys.append(self.shared_emb(key_vec))
-
-        self.values = []
-        for value in sampled_df['values']:
-            value_vec = vocs.txt2vec(value)
+            value_vec = vocs.txt2vec(el['values'])
             value_vec = torch.tensor(value_vec, dtype=torch.long)
             self.values.append(value_vec)
-            #self.encoded_values.append(self.shared_emb(value_vec))
-        # TODO: emd.mean(0) ?
         
         self.softmax = nn.Softmax(dim=0)
         self.cosine = nn.CosineSimilarity(dim=1, eps=1e-6)
@@ -58,14 +90,6 @@ class KVmemNN(nn.Module):
         persona: our persona
         candidates: candidates answers called 'distractor responses' in the paper $3.4
         """
-        # print('='*50)
-        # print(xs)
-        # x = torch.tensor(xs, dtype=torch.long)
-        # x = self.shared_emb(x).mean(1)
-        # print(x)
-        # print(x.size())
-        # print('='*50)
-        # exit(0)
         encoded_keys = []
         encoded_values = []
         for k in self.keys:
@@ -92,17 +116,11 @@ class KVmemNN(nn.Module):
         encoded_values = torch.stack(encoded_values)
         encoded_candidates = torch.stack(encoded_candidates)
         encoded_persona = torch.stack(encoded_persona)
-        encoded_questions = torch.stack(encoded_xs).view(-1, 128)
+        encoded_questions = torch.stack(encoded_xs).view(-1, self.embedding_size)
 
         x = torch.tensor(xs, dtype=torch.long)
-        encoded_question = self.shared_emb(x).mean(1).view(-1, 128)
+        encoded_question = self.shared_emb(x).mean(1).view(-1, self.embedding_size)
         q = encoded_question
-        # print('keys: {}, values: {}, candidates: {}'.format(encoded_keys.size(),
-        #                                                     encoded_values.size(),
-        #                                                     encoded_candidates.size())
-        #       , 'persona: {}, xs: {}, x: {}'.format(encoded_persona.size(),
-        #                                             encoded_questions.size(),
-        #                                             encoded_question.size()))
 
         sim = self.cosine(encoded_questions, encoded_persona)
         softSim = self.softmax(sim)
@@ -132,47 +150,7 @@ class KVmemNN(nn.Module):
     #return (encoded_candidates[preds.argmax()], encoded_candidates[-1])
 
 
-class EncoderRNN(nn.Module):
-    def __init__(self, input_size, hidden_size, numlayers):
-        super().__init__()
-        self.hidden_size = hidden_size
-
-        self.embedding = nn.Embedding(input_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size, num_layers=numlayers,
-                          batch_first=True)
-
-    def forward(self, input, hidden):
-        embedded = self.embedding(input)
-        output, hidden = self.gru(embedded, hidden)
-        return output, hidden
-
-
-class DecoderRNN(nn.Module):
-    def __init__(self, output_size, hidden_size, numlayers):
-        super().__init__()
-        self.hidden_size = hidden_size
-
-        self.embedding = nn.Embedding(output_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size, num_layers=numlayers,
-                          batch_first=True)
-        self.out = nn.Linear(hidden_size, output_size)
-        self.softmax = nn.LogSoftmax(dim=2)
-
-    def forward(self, input, hidden):
-        emb = self.embedding(input)
-        rel = F.relu(emb)
-        output, hidden = self.gru(rel, hidden)
-        scores = self.softmax(self.out(output))
-        return scores, hidden
-
-
 class ArmsAgent(Agent):
-    """Agent which takes an input sequence and produces an output sequence.
-
-    This model is based of Sean Robertson's seq2seq tutorial
-    `here <http://pytorch.org/tutorials/intermediate/seq2seq_translation_tutorial.html>`_.
-    """
-
     @staticmethod
     def dictionary_class():
         return DictionaryAgent
@@ -180,7 +158,7 @@ class ArmsAgent(Agent):
     @staticmethod
     def add_cmdline_args(argparser):
         """Add command-line arguments specifically for this agent."""
-        agent = argparser.add_argument_group('Seq2Seq Arguments')
+        agent = argparser.add_argument_group('KvMemNN Arguments')
         agent.add_argument('-hs', '--hiddensize', type=int, default=128,
                            help='size of the hidden layers')
         agent.add_argument('-esz', '--embeddingsize', type=int, default=128,
@@ -214,36 +192,23 @@ class ArmsAgent(Agent):
             
             # set up model from scratch
             self.dict = DictionaryAgent(opt)
-            hsz = opt['hiddensize']
+            emb_size = opt['embeddingsize']
             nl = opt['numlayers']
 
-            self.model = KVmemNN(self.dict, hsz)
-
-            """HEHEHE
-            # encoder captures the input text
-            self.encoder = EncoderRNN(len(self.dict), hsz, nl)
-            # decoder produces our output states
-            self.decoder = DecoderRNN(len(self.dict), hsz, nl)
-
-            if self.use_cuda:
-                self.encoder.cuda()
-                self.decoder.cuda()
-
-            if opt.get('numthreads', 1) > 1:
-                self.encoder.share_memory()
-                self.decoder.share_memory()
-            HEHEHE"""
+            self.model = KVmemNN(self.dict, emb_size)
+            print(self.model.parameters)
+            self.model.share_memory()
         else:
             # ... copy initialized data from shared table
             self.opt = shared['opt']
             self.dict = shared['dict']
             self.model = shared['model']
-            """HEHEHE
-            if 'encoder' in shared:
-                # hogwild shares model as well
-                self.encoder = shared['encoder']
-                self.decoder = shared['decoder']
-            HEHEHE"""
+
+        print('[*] Info: loading dialog file...')
+        all_cands_df = pd.read_csv('/home/arms/research/dialog.csv')
+        all_cands = all_cands_df['keys'] + all_cands_df['values']
+        self.all_cands = [self.dict.txt2vec(cand) for cand in all_cands]
+        print('[*] Info: cands ready...')
 
         if hasattr(self, 'model'):
             # we set up a model for original instance and multithreaded ones
@@ -252,13 +217,8 @@ class ArmsAgent(Agent):
             
             # set up optims for each module
             lr = opt['learningrate']
-            self.optims = {
-                'model': optim.SGD(self.model.parameters(), lr=lr),
-            }
+            self.optimizer = optim.SGD(self.model.parameters(), lr=lr)
 
-            self.longest_label = 1
-            self.hiddensize = opt['hiddensize']
-            self.numlayers = opt['numlayers']
             # we use END markers to end our output
             self.END_IDX = self.dict[self.dict.end_token]
             # get index of null token from dictionary (probably 0)
@@ -269,31 +229,6 @@ class ArmsAgent(Agent):
             if self.use_cuda:
                 self.START = self.START.cuda()
 
-        """HEHEHE
-        if hasattr(self, 'encoder'):
-            # we set up a model for original instance and multithreaded ones
-            self.criterion = nn.NLLLoss()
-
-            # set up optims for each module
-            lr = opt['learningrate']
-            self.optims = {
-                'encoder': optim.SGD(self.encoder.parameters(), lr=lr),
-                'decoder': optim.SGD(self.decoder.parameters(), lr=lr),
-            }
-
-            self.longest_label = 1
-            self.hiddensize = opt['hiddensize']
-            self.numlayers = opt['numlayers']
-            # we use END markers to end our output
-            self.END_IDX = self.dict[self.dict.end_token]
-            # get index of null token from dictionary (probably 0)
-            self.NULL_IDX = self.dict[self.dict.null_token]
-            # we use START markers to start our output
-            self.START_IDX = self.dict[self.dict.start_token]
-            self.START = torch.LongTensor([self.START_IDX])
-            if self.use_cuda:
-                self.START = self.START.cuda()
-        HEHEHE"""
         self.reset()
 
     def reset(self):
@@ -303,13 +238,13 @@ class ArmsAgent(Agent):
 
     def zero_grad(self):
         """Zero out optimizer."""
-        for optimizer in self.optims.values():
-            optimizer.zero_grad()
+        #for optimizer in self.optims.values():
+        self.optimizer.zero_grad()
 
     def update_params(self):
         """Do one optimization step."""
-        for optimizer in self.optims.values():
-            optimizer.step()
+        #for optimizer in self.optims.values():
+        self.optimizer.step()
 
     def share(self):
         """Share internal states between parent and child instances."""
@@ -324,17 +259,13 @@ class ArmsAgent(Agent):
         return shared
 
     def observe(self, observation):
+        print('Observe!')
         observation = copy.deepcopy(observation)
         if not self.episode_done:
             # if the last example wasn't the end of an episode, then we need to
             # recall what was said in that example
             prev_dialogue = self.observation['text']
             observation['text'] = prev_dialogue + '\n' + observation['text']
-            
-        # import pprint
-        # pprint.pprint(observation)
-        # if observation['episode_done']:
-        #     exit(0)
 
         self.observation = observation
         self.episode_done = observation['episode_done']
@@ -346,81 +277,18 @@ class ArmsAgent(Agent):
         Update the model using the targets if available.
         """
         if is_training:
-            self.zero_grad()
             self.model.train()
-            pred = self.model(xs, cands, persona, ys)
-            loss = self.criterion(pred.view(1, -1), torch.tensor([19]))
-            loss.backward()
-            self.update_params()
-            return pred.argmax()
-        """HEHEHE
-        bsz = xs.size(0)
-        zeros = Variable(torch.zeros(self.numlayers, bsz, self.hiddensize))
-        if self.use_cuda:
-            zeros = zeros.cuda()
-        starts = Variable(self.START)
-        starts = starts.expand(bsz, 1)  # expand to batch size
-
-        if is_training:
-            loss = 0
             self.zero_grad()
-            self.encoder.train()
-            self.decoder.train()
-            target_length = ys.size(1)
-            # save largest seen label for later
-            self.longest_label = max(target_length, self.longest_label)
-
-            encoder_outputs, encoder_hidden = self.encoder(xs, zeros)
-
-            # Teacher forcing: Feed the target as the next input
-            y_in = ys.narrow(1, 0, ys.size(1) - 1)
-            decoder_input = torch.cat([starts, y_in], 1)
-            decoder_output, decoder_hidden = self.decoder(decoder_input,
-                                                          encoder_hidden)
-
-            scores = decoder_output.view(-1, decoder_output.size(-1))
-            loss = self.criterion(scores, ys.view(-1))
+            pred = self.model(xs, cands, persona, ys)
+            loss = self.criterion(pred.view(1, -1), torch.tensor([ys]))
             loss.backward()
             self.update_params()
-
-            _max_score, idx = decoder_output.max(2)
-            predictions = idx
+            print('argmax: ', pred.argmax())
+            return pred.argmax()
         else:
-            # just predict
-            self.encoder.eval()
-            self.decoder.eval()
-            encoder_output, encoder_hidden = self.encoder(xs, zeros)
-            decoder_hidden = encoder_hidden
-
-            predictions = []
-            scores = []
-            done = [False for _ in range(bsz)]
-            total_done = 0
-            decoder_input = starts
-
-            for _ in range(self.longest_label):
-                # generate at most longest_label tokens
-                decoder_output, decoder_hidden = self.decoder(decoder_input,
-                                                              decoder_hidden)
-                _max_score, idx = decoder_output.max(2)
-                preds = idx
-                decoder_input = preds
-                predictions.append(preds)
-
-                # check if we've produced the end token
-                for b in range(bsz):
-                    if not done[b]:
-                        # only add more tokens for examples that aren't done
-                        if preds.data[b][0] == self.END_IDX:
-                            # if we produced END, we're done
-                            done[b] = True
-                            total_done += 1
-                if total_done == bsz:
-                    # no need to generate any more
-                    break
-            predictions = torch.cat(predictions, 1)
-        HEHEHE"""
-        return predictions
+            self.model.eval()
+            pred = self.model(xs, cands, persona, ys)
+            return pred.argmax()
 
     def vectorize(self, observations):
         """Convert a list of observations into input & target tensors."""
@@ -428,97 +296,76 @@ class ArmsAgent(Agent):
 
         xs, ys, cands, persona = [None]*4
 
-        # print("="*50)
-        # print('XS: ')
         xs = [self.dict.txt2vec(obs['text'].split('\n')[-1]) for obs in observations]
-        # print([obs['text'].split('\n')[-1] for obs in observations])
-        # print(xs)
-        # print("="*50)
         if is_training:
-            # print("="*50)
-            # print("YS: ")
-            ys = [self.dict.txt2vec(obs['labels'][0]) for obs in observations]
-            # print([obs['labels'][0] for obs in observations])
-            # print(ys)
-            # print("="*50)
-        # print("="*50)
-        # print('candidates: ')
-        cands = [self.dict.txt2vec(cand) for obs in observations
-                 for cand in obs['label_candidates']]
-        # print([cand for obs in observations
-        #        for cand in obs['label_candidates']])
-        # print(cands)
-        # print(len(cands))
-        # print("="*50)
+            ys = list(observations[0]['label_candidates']).index(
+                observations[0]['labels'][0])
+            #ys = [self.dict.txt2vec(obs['labels'][0]) for obs in observations]
+            cands = [self.dict.txt2vec(cand) for obs in observations
+                     for cand in obs['label_candidates']]
         
         persona_label = 'your persona:'
         persona = [self.dict.txt2vec(p[len(persona_label):]) for obs in observations
                    for p in obs['text'].split('\n')
                    if p.find(persona_label) != -1]
-        # print([p[len(persona_label):] for obs in observations
-        #        for p in obs['text'].split('\n')
-        #        if p.find(persona_label) != -1])
-        # print(persona)
+        if persona == []:
+            import pprint
+            pprint.pprint(observations)
 
-        """HEHEHE
-        # utility function for padding text and returning lists of indices
-        # parsed using the provided dictionary
-        xs, ys, labels, valid_inds, _, _ = PaddingUtils.pad_text(
-            observations, self.dict, end_idx=self.END_IDX,
-            null_idx=self.NULL_IDX, dq=False, eval_labels=True)
-        if xs is None:
-            return None, None, None, None, None
-
-        # move lists of indices returned above into tensors
-        xs = torch.LongTensor(xs)
-        if self.use_cuda:
-            xs = xs.cuda()
-        xs = Variable(xs)
-
-        if ys is not None:
-            ys = torch.LongTensor(ys)
-            if self.use_cuda:
-                ys = ys.cuda()
-            ys = Variable(ys)
-        HEHEHE"""
         return xs, ys, cands, persona, is_training
 
     def batch_act(self, observations):
         batchsize = len(observations)
         # initialize a table of replies with this agent's id
         batch_reply = [{'id': self.getID()} for _ in range(batchsize)]
-        
+
         xs, ys, cands, persona, is_training = self.vectorize(observations)
-        predictions = self.predict(xs, cands, persona, ys, is_training)
-        batch_reply[0]['text'] = observations[0]['label_candidates'][predictions.argmax()]
+        if is_training:
+            print('training')
+            pred = self.predict(xs, cands, persona, ys, is_training)
+
+            print('argxmaxinbatch:', pred)
+            
+            batch_reply[0]['text'] = observations[0]['label_candidates'][pred]
+
+            print('batch_reply', batch_reply)
+
+        else:
+            print('Predicting..')
+            pred = self.predict(xs, self.all_cands, persona, ys, is_training)
+            print('argxmaxinbatch:', pred)
+            batch_reply[0]['text'] = self.dict.vec2txt(self.all_cands[pred])
+
+            print('predicting done.')
+            print(batch_reply)
         return batch_reply
-        """HEHEHE
-        # convert the observations into batches of inputs and targets
-        # `labels` stores the true labels returned in the `ys` vector
-        # `valid_inds` tells us the indices of all valid examples
-        # e.g. for input [{}, {'text': 'hello'}, {}, {}], valid_inds is [1]
-        # since the other three elements had no 'text' field
-        xs, ys, labels, valid_inds, is_training = self.vectorize(observations)
-
-        if xs is None:
-            # no valid examples, just return empty responses
-            return batch_reply
-        HEHEHE"""
-        
-        #predictions = self.predict(xs, cands, persona, ys, is_training)
-
-        """HEHEHE
-        # maps returns predictions back to the right `valid_inds`
-        # in the example above, a prediction `world` should reply to `hello`
-        PaddingUtils.map_predictions(
-            predictions.cpu().data, valid_inds, batch_reply, observations,
-            self.dict, self.END_IDX, labels=labels,
-            answers=labels, ys=ys.data if ys is not None else None,
-            report_freq=self.opt.get('report_freq', 0))
-
-        return batch_reply
-        HEHEHE"""
         
     def act(self):
         # call batch_act with this batch of one
         return self.batch_act([self.observation])[0]
+
+    def shutdown(self):
+        #"""Save the state of the model when shutdown."""
+        super().shutdown()
+
+    def save(self, path=None):
+        """Save model parameters if model_file is set."""
+        path = self.opt.get('model_file', None) if path is None else path
+        if path and hasattr(self, 'model'):
+            data = {}
+            data['model'] = self.model.state_dict()
+            data['optimizer'] = self.optimizer.state_dict()
+            data['opt'] = self.opt
+            with open(path, 'wb') as handle:
+                torch.save(data, handle)
+            with open(path + ".opt", 'wb') as handle:
+                pickle.dump(self.opt, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def load(self, path):
+        """Return opt and model states."""
+        print('Loading existing model params from ' + path)
+        data = torch.load(path, map_location=lambda cpu, _: cpu)
+        self.model.load_state_dict(data['model'])
+        self.reset()
+        self.optimizer.load_state_dict(data['optimizer'])
+        self.opt = self.override_opt(data['opt'])

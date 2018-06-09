@@ -16,8 +16,10 @@ if __name__ == '__main__':
     parser = ParlaiParser(add_model_args=True)
     parser.add_argument('-d', '--display-examples', type='bool', default=False)
     parser.set_defaults(
-        model='projects.personachat.kvmemnn.kvmemnn:Kvmemnn',
-        model_file='models:convai2/kvmemnn/model',
+        model='projects.personachat.kvmemnn.arms:ArmsAgent',
+        model_file='/tmp/persona_self_original.checkpoint',
+        #model='projects.personachat.kvmemnn.kvmemnn:Kvmemnn',
+        #model_file='models:convai2/kvmemnn/model',
     )
     opt = parser.parse_args()
     # build all profile memory models
