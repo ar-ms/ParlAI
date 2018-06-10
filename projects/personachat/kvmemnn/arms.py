@@ -69,7 +69,7 @@ class KVmemNN(nn.Module):
                                        sparse=True).cuda()
         dialogs_df = pd.read_csv('/home/arms/dialog.csv')
 
-        sampled_df = dialogs_df.sample(5000)
+        sampled_df = dialogs_df.sample(1000)
         self.keys = []
         self.values = []
         for i, el in sampled_df.iterrows():
@@ -185,8 +185,8 @@ class ArmsAgent(Agent):
 
         # check for cuda
         self.use_cuda = not opt.get('no_cuda') and torch.cuda.is_available()
-        if opt.get('numthreads', 1) > 1:
-            torch.set_num_threads(1)
+        #if opt.get('numthreads', 1) > 1:
+        #    torch.set_num_threads(1)
         self.id = 'armsagent'
 
         if not shared:
@@ -201,7 +201,7 @@ class ArmsAgent(Agent):
             self.model.share_memory()
             print('[*] Info: loading dialog file...')
             all_cands_df = pd.read_csv('/home/arms/dialog.csv')
-            all_cands = all_cands_df['keys'] + all_cands_df['values']
+            all_cands = all_cands_df['keys'].tolist() + all_cands_df['values'].tolist()
             self.all_cands = [self.dict.txt2vec(cand) for cand in all_cands]
             print('[*] Info: cands ready...')
         else:
@@ -257,7 +257,6 @@ class ArmsAgent(Agent):
         return shared
 
     def observe(self, observation):
-        print('Observe!')
         observation = copy.deepcopy(observation)
         if not self.episode_done:
             # if the last example wasn't the end of an episode, then we need to
@@ -281,7 +280,6 @@ class ArmsAgent(Agent):
             loss = self.criterion(pred.view(1, -1), torch.tensor([ys]).cuda())
             loss.backward()
             self.update_params()
-            print('argmax: ', pred.argmax())
             return pred.argmax()
         else:
             self.model.eval()
@@ -302,7 +300,10 @@ class ArmsAgent(Agent):
             ys = 19
             cands = [self.dict.txt2vec(cand) for obs in observations
                      for cand in obs['label_candidates']]
-        
+        else:
+            print('*'*20)
+            print([obs['text'].split('\n')[-1] for obs in observations])
+            print('*'*20)
         persona_label = 'your persona:'
         persona = [self.dict.txt2vec(p[len(persona_label):]) for obs in observations
                    for p in obs['text'].split('\n')
@@ -320,23 +321,17 @@ class ArmsAgent(Agent):
 
         xs, ys, cands, persona, is_training = self.vectorize(observations)
         if is_training:
-            print('training')
             pred = self.predict(xs, cands, persona, ys, is_training)
-
-            print('argxmaxinbatch:', pred)
             
             batch_reply[0]['text'] = observations[0]['label_candidates'][pred]
 
-            print('batch_reply', batch_reply)
-
         else:
-            print('Predicting..')
             pred = self.predict(xs, self.all_cands, persona, ys, is_training)
-            print('argxmaxinbatch:', pred)
             batch_reply[0]['text'] = self.dict.vec2txt(self.all_cands[pred])
+            print(pred,
+                  observations[0]['text'],
+                  batch_reply)
 
-            print('predicting done.')
-            print(batch_reply)
         return batch_reply
         
     def act(self):
