@@ -334,9 +334,7 @@ class ArmsAgent(Agent):
             word = ' ' + word + ' '
             dfs.append(self.dialogs_df[self.dialogs_df['keys'].str.contains(word)])
 
-        try:
-            assert(len(dfs)>0)
-        except AssertionError:
+        if len(dfs)==0 or len(dfs[0])==0:
             dfs.append(self.dialogs_df.sample(100))
             
         dfs = pd.concat(dfs)
