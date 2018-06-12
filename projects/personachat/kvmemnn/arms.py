@@ -60,27 +60,15 @@ class KVmemNN(nn.Module):
     def __init__(self, vocs, embedding_size=100, n_hops=2):
         super(KVmemNN, self).__init__()
 
-        #print(len(load_cands('/home/arms/research/ParlAI/data/ConvAI2/train_self_original.txt')))
         self.embedding_size = embedding_size
         vocab_size = len(vocs)
         self.n_hops = n_hops
         self.shared_emb = nn.Embedding(num_embeddings=vocab_size,
                                        embedding_dim=embedding_size,
                                        sparse=True)
-        # dialogs_df = pd.read_csv('/home/arms/research/dialog.csv')
-        # sampled_df = dialogs_df.sample(200)
-        # self.keys = []
-        # self.values = []
-        # for i, el in sampled_df.iterrows():
-        #     key_vec = vocs.txt2vec(el['keys'])
-        #     key_vec = torch.tensor(key_vec, dtype=torch.long)
-        #     self.keys.append(key_vec)
-        #     value_vec = vocs.txt2vec(el['values'])
-        #     value_vec = torch.tensor(value_vec, dtype=torch.long)
-        #     self.values.append(value_vec)
         
         self.softmax = nn.Softmax(dim=0)
-        self.cosine = nn.CosineSimilarity(dim=0, eps=1e-6)
+        self.cosine = nn.CosineSimilarity(dim=1, eps=1e-6)
         self.R = nn.Linear(embedding_size, embedding_size, bias=False)
 
     def forward(self, xs, candidates, persona, keys, values, label):
@@ -93,34 +81,54 @@ class KVmemNN(nn.Module):
         encoded_keys = []
         encoded_values = []
         for k in keys:
+            k = torch.tensor(k, dtype=torch.long, requires_grad=False)
             encoded_keys.append(self.shared_emb(k).mean(0))
             
         for v in values:
+            v = torch.tensor(v, dtype=torch.long, requires_grad=False)
             encoded_values.append(self.shared_emb(v).mean(0))
 
         encoded_candidates = []
         for cand in candidates:
-            cand = torch.tensor(cand, dtype=torch.long)
+            cand = torch.tensor(cand, dtype=torch.long, requires_grad=False)
             encoded_candidates.append(self.shared_emb(cand).mean(0))
             
         encoded_persona = []
-        encoded_xs = []
         for p in persona:
-            p = torch.tensor(p, dtype=torch.long)
+            p = torch.tensor(p, dtype=torch.long, requires_grad=False)
             encoded_persona.append(self.shared_emb(p).mean(0))
 
-            x = torch.tensor(xs, dtype=torch.long)
-            encoded_xs.append(self.shared_emb(x).mean(1))
+        encoded_keys = torch.stack(encoded_keys)
+        encoded_values = torch.stack(encoded_values)
+        encoded_candidates = torch.stack(encoded_candidates)
+        encoded_persona = torch.stack(encoded_persona)
+        
+        x = torch.tensor(xs, dtype=torch.long, requires_grad=False)
+        q = self.shared_emb(x).mean(1).view(self.embedding_size)
+        
+        ret = self.softmax(self.cosine(q.expand_as(encoded_persona),
+                                       encoded_persona))
+        first_hop_sum = (ret.view(-1, 1)*encoded_persona).sum(dim=0)
+        q_plus = self.R(q + first_hop_sum)
 
-        x = torch.tensor(xs, dtype=torch.long)
+        ret = self.softmax(self.cosine(q_plus.expand_as(encoded_keys),
+                                            encoded_keys))
+        first_hop_sum = torch.sum(ret.view(-1, 1)*encoded_values, dim=0)
+        q_plus_plus = self.R(q_plus + first_hop_sum)
+
+        preds = self.cosine(q_plus_plus.expand_as(encoded_candidates),
+                                    encoded_candidates)
+        #print(preds)
+        return preds
+
         q = self.shared_emb(x).mean(1).view(self.embedding_size)
         first_hop_sum = 0
         for pi in encoded_persona:
             #print('q:', q.size(), 'pi:', pi.size())
             si = self.softmax(self.cosine(q, pi))
-            #print('si:', si, si.size())
+            print('si:', si, si.size())
             first_hop_sum += si*pi
-            
+
         q_plus = q + first_hop_sum
 
         second_hop_sum = 0
@@ -135,7 +143,6 @@ class KVmemNN(nn.Module):
         #     print('q_plus:', q_plus_plus.size(), 'ci:', ci.size())
         #     print(self.cosine(q_plus_plus, ci))
 
-        encoded_candidates = torch.stack(encoded_candidates)
         preds = F.cosine_similarity(q_plus_plus.expand_as(encoded_candidates),
                                     encoded_candidates,
                                     dim=1)
@@ -232,7 +239,7 @@ class ArmsAgent(Agent):
 
             print('[*] Info: loading dialog file...')
             self.dialogs_df = pd.read_csv('/home/arms/research/dialog.csv')
-            all_cands = self.dialogs_df['keys'].tolist() + self.dialogs_df['values'].tolist()
+            all_cands = self.dialogs_df['values'].tolist()#self.dialogs_df['keys'].tolist() + self.dialogs_df['values'].tolist()
             self.all_cands = [self.dict.txt2vec(cand) for cand in all_cands]
             print('[*] Info: cands ready...')
 
@@ -338,18 +345,15 @@ class ArmsAgent(Agent):
             dfs.append(self.dialogs_df.sample(100))
             
         dfs = pd.concat(dfs)
-        if len(dfs) > 1000 or len(dfs) < 10:
-            print('dfsLength: ', len(dfs))
-            print([(w, self.dict.freq[w]) for w in words])
 
         keys = []
         values = []
         for _, el in dfs.iterrows():
             key_vec = self.dict.txt2vec(el['keys'])
-            key_vec = torch.tensor(key_vec, dtype=torch.long)
+            #key_vec = torch.tensor(key_vec, dtype=torch.long, requires_grad=True)
             keys.append(key_vec)
             value_vec = self.dict.txt2vec(el['values'])
-            value_vec = torch.tensor(value_vec, dtype=torch.long)
+            #value_vec = torch.tensor(value_vec, dtype=torch.long, requires_grad=True)
             values.append(value_vec)
 
         xs = [self.dict.txt2vec(obs['text'].split('\n')[-1]) for obs in observations]
@@ -364,9 +368,6 @@ class ArmsAgent(Agent):
         persona = [self.dict.txt2vec(p[len(persona_label):]) for obs in observations
                    for p in obs['text'].split('\n')
                    if p.find(persona_label) != -1]
-        if persona == []:
-            import pprint
-            pprint.pprint(observations)
 
         return xs, ys, cands, persona, keys, values, is_training
 
@@ -378,16 +379,15 @@ class ArmsAgent(Agent):
         xs, ys, cands, persona, keys, values, is_training = self.vectorize(observations)
         if is_training:
             pred = self.predict(xs, cands, persona, keys, values, ys, is_training)
-
             batch_reply[0]['text'] = observations[0]['label_candidates'][pred]
         else:
             print('Predicting..')
             pred = self.predict(xs, self.all_cands, persona, keys, values, ys, is_training)
             print('argxmaxinbatch:', pred)
             batch_reply[0]['text'] = self.dict.vec2txt(self.all_cands[pred])
-
-            print('predicting done.')
+            print(observations[0]['text'])
             print(batch_reply)
+            print('predicting done.')
         return batch_reply
         
     def act(self):
