@@ -80,7 +80,7 @@ class KVmemNN(nn.Module):
         #     self.values.append(value_vec)
         
         self.softmax = nn.Softmax(dim=0)
-        self.cosine = nn.CosineSimilarity(dim=1, eps=1e-6)
+        self.cosine = nn.CosineSimilarity(dim=0, eps=1e-6)
         self.R = nn.Linear(embedding_size, embedding_size, bias=False)
 
     def forward(self, xs, candidates, persona, keys, values, label):
@@ -111,6 +111,37 @@ class KVmemNN(nn.Module):
 
             x = torch.tensor(xs, dtype=torch.long)
             encoded_xs.append(self.shared_emb(x).mean(1))
+
+        x = torch.tensor(xs, dtype=torch.long)
+        q = self.shared_emb(x).mean(1).view(self.embedding_size)
+        first_hop_sum = 0
+        for pi in encoded_persona:
+            #print('q:', q.size(), 'pi:', pi.size())
+            si = self.softmax(self.cosine(q, pi))
+            #print('si:', si, si.size())
+            first_hop_sum += si*pi
+            
+        q_plus = q + first_hop_sum
+
+        second_hop_sum = 0
+        for ki, vi in zip(encoded_keys, encoded_values):
+            #print('q:', q_plus.size(), 'ki:', ki.size())
+            si = self.softmax(self.cosine(q_plus, ki))
+            #print('si:', si, si.size())
+            second_hop_sum += si*vi
+
+        q_plus_plus = q_plus + first_hop_sum
+        # for ci in encoded_candidates:
+        #     print('q_plus:', q_plus_plus.size(), 'ci:', ci.size())
+        #     print(self.cosine(q_plus_plus, ci))
+
+        encoded_candidates = torch.stack(encoded_candidates)
+        preds = F.cosine_similarity(q_plus_plus.expand_as(encoded_candidates),
+                                    encoded_candidates,
+                                    dim=1)
+        #print(preds)
+
+        return preds
 
         encoded_keys = torch.stack(encoded_keys)
         encoded_values = torch.stack(encoded_values)
