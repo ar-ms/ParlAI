@@ -107,7 +107,7 @@ def run_eval(agent, opt, datatype, max_exs=-1, write_log=False, valid_world=None
 
     i_example = 0
     print('== Before valid ==')
-    while not valid_world.epoch_done() and opt['validation_max_examples'] > i_example:
+    while not valid_world.epoch_done():# and opt['validation_max_examples'] > i_example:
         valid_world.parley()
         if cnt == 0 and opt['display_examples']:
             print(valid_world.display() + '\n~~')
@@ -189,6 +189,7 @@ class TrainLoop():
             self.agent.save(opt['model_file'] + '.checkpoint')
         if hasattr(self.agent, 'receive_metrics'):
             self.agent.receive_metrics(valid_report)
+        print(valid_report)
         new_valid = valid_report[opt['validation_metric']]
         if self.best_valid is None or self.valid_optim * new_valid > self.valid_optim * self.best_valid:
             print('[ new best {}: {}{} ]'.format(
@@ -258,7 +259,7 @@ class TrainLoop():
                     break
                 if self.log_time.time() > self.log_every_n_secs:
                     self.log()
-                if self.validate_time.time() > self.val_every_n_secs and world.episode_done():
+                if self.validate_time.time() > self.val_every_n_secs and (opt.get('numthreads', 1)>1 or world.episode_done()):
                     stop_training = self.validate()
                     if stop_training:
                         break
