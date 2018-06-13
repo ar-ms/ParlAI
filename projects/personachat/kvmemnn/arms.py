@@ -69,7 +69,8 @@ class KVmemNN(nn.Module):
         
         self.softmax = nn.Softmax(dim=0)
         self.cosine = nn.CosineSimilarity(dim=1, eps=1e-6)
-        self.R = nn.Linear(embedding_size, embedding_size, bias=False)
+        self.R = nn.Linear(embedding_size, embedding_size, bias=True)
+        self.R2 = nn.Linear(embedding_size, embedding_size, bias=True)
 
     def forward(self, xs, candidates, persona, keys, values, label):
         """
@@ -114,7 +115,7 @@ class KVmemNN(nn.Module):
         ret = self.softmax(self.cosine(q_plus.expand_as(encoded_keys),
                                             encoded_keys))
         first_hop_sum = torch.sum(ret.view(-1, 1)*encoded_values, dim=0)
-        q_plus_plus = self.R(q_plus + first_hop_sum)
+        q_plus_plus = self.R2(q_plus + first_hop_sum)
 
         preds = self.cosine(q_plus_plus.expand_as(encoded_candidates),
                                     encoded_candidates)
