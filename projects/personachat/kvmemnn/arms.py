@@ -71,7 +71,9 @@ class KVmemNN(nn.Module):
         self.cosine = nn.CosineSimilarity(dim=1, eps=1e-6)
         self.R = nn.Linear(embedding_size, embedding_size, bias=True)
         self.R2 = nn.Linear(embedding_size, embedding_size, bias=True)
-
+        self.encoded_candidates = []
+        self.encoded_candidates_stacked = []
+        
     def forward(self, xs, candidates, persona, keys, values, label):
         """
         xs: utterance of the other persona
@@ -89,10 +91,13 @@ class KVmemNN(nn.Module):
             v = torch.tensor(v, dtype=torch.long, requires_grad=False)
             encoded_values.append(self.shared_emb(v).mean(0))
 
-        encoded_candidates = []
-        for cand in candidates:
-            cand = torch.tensor(cand, dtype=torch.long, requires_grad=False)
-            encoded_candidates.append(self.shared_emb(cand).mean(0))
+        if len(self.encoded_candidates) == 0:
+            print('embedding cadidates...')
+            for i, cand in enumerate(candidates):
+                if i %  1000 == 0:
+                    print('candidates ', i)
+                cand = torch.tensor(cand, dtype=torch.long, requires_grad=False)
+                self.encoded_candidates.append(self.shared_emb(cand).mean(0))
             
         encoded_persona = []
         for p in persona:
@@ -101,9 +106,11 @@ class KVmemNN(nn.Module):
 
         encoded_keys = torch.stack(encoded_keys)
         encoded_values = torch.stack(encoded_values)
-        encoded_candidates = torch.stack(encoded_candidates)
+        if len(self.encoded_candidates_stacked) == 0:
+            print('staking candidates..')
+            self.encoded_candidates_stacked = torch.stack(self.encoded_candidates)
         encoded_persona = torch.stack(encoded_persona)
-        
+        print('starting evaluation..')
         x = torch.tensor(xs, dtype=torch.long, requires_grad=False)
         q = self.shared_emb(x).mean(1).view(self.embedding_size)
         
@@ -117,8 +124,9 @@ class KVmemNN(nn.Module):
         first_hop_sum = torch.sum(ret.view(-1, 1)*encoded_values, dim=0)
         q_plus_plus = self.R2(q_plus + first_hop_sum)
 
-        preds = self.cosine(q_plus_plus.expand_as(encoded_candidates),
-                                    encoded_candidates)
+        print(q_plus_plus.size(), self.encoded_candidates_stacked.size())
+        preds = self.cosine(q_plus_plus.expand_as(self.encoded_candidates_stacked),
+                                    self.encoded_candidates_stacked)
         #print(preds)
         return preds
 
@@ -230,8 +238,12 @@ class ArmsAgent(Agent):
         if not shared:
             
             # set up model from scratch
+            opt['dict_file'] = '/home/arms/ParlAI/data/models/personachat/kvmemnn/kvmemnn/persona_self_original.dict'
+            #opt['dict_initpath'] = 'models:personachat/kvmemnn/kvmemnn/persona_self_original.dict'
+
             self.dict = DictionaryAgent(opt)
             emb_size = opt['embeddingsize']
+            emb_size = 500
             nl = opt['numlayers']
 
             self.model = KVmemNN(self.dict, emb_size)
@@ -239,7 +251,7 @@ class ArmsAgent(Agent):
             self.model.share_memory()
 
             print('[*] Info: loading dialog file...')
-            self.dialogs_df = pd.read_csv('/home/arms/research/dialog.csv')
+            self.dialogs_df = pd.read_csv('/home/arms/dialog.csv')
             all_cands = self.dialogs_df['values'].tolist()#self.dialogs_df['keys'].tolist() + self.dialogs_df['values'].tolist()
             self.all_cands = [self.dict.txt2vec(cand) for cand in all_cands]
             print('[*] Info: cands ready...')
@@ -294,6 +306,8 @@ class ArmsAgent(Agent):
         return shared
 
     def observe(self, observation):
+        import pprint
+        pprint.pprint(observation)
         observation = copy.deepcopy(observation)
         if not self.episode_done:
             # if the last example wasn't the end of an episode, then we need to
@@ -302,7 +316,7 @@ class ArmsAgent(Agent):
             observation['text'] = prev_dialogue + '\n' + observation['text']
 
         self.observation = observation
-        self.episode_done = observation['episode_done']
+        self.episode_done = True#observation['episode_done']
         return observation
 
     def predict(self, xs, cands, persona, keys, values, ys=None, is_training=False):
@@ -320,7 +334,10 @@ class ArmsAgent(Agent):
             print('argmax: ', pred.argmax())
             return pred.argmax()
         else:
+            print('set evel')
             self.model.eval()
+            print('asking model')
+            print(xs)
             pred = self.model(xs, cands, persona, keys, values, ys)
             return pred.argmax()
 
@@ -367,9 +384,9 @@ class ArmsAgent(Agent):
         
         persona_label = 'your persona:'
         persona = [self.dict.txt2vec(p[len(persona_label):]) for obs in observations
-                   for p in obs['text'].split('\n')
-                   if p.find(persona_label) != -1]
-
+                   for p in obs['text'].split('\n')[:-1]]
+        #if p.find(persona_label) != -1]
+        print(persona, obs['text'].split('\n')[:-1])
         return xs, ys, cands, persona, keys, values, is_training
 
     def batch_act(self, observations):
