@@ -69,8 +69,9 @@ class KVmemNN(nn.Module):
         
         self.softmax = nn.Softmax(dim=0)
         self.cosine = nn.CosineSimilarity(dim=1, eps=1e-6)
-        self.R = nn.Linear(embedding_size, embedding_size, bias=True)
-        self.R2 = nn.Linear(embedding_size, embedding_size, bias=True)
+
+        self.R = nn.Linear(embedding_size, embedding_size, bias=False)
+        self.R2 = nn.Linear(embedding_size, embedding_size, bias=False)
 
     def forward(self, xs, candidates, persona, keys, values, label):
         """
@@ -377,7 +378,11 @@ class ArmsAgent(Agent):
         # initialize a table of replies with this agent's id
         batch_reply = [{'id': self.getID()} for _ in range(batchsize)]
 
+        if batchsize == 0 or 'text' not in observations[0]:
+            return [{ 'text': 'dunno' }]
+
         xs, ys, cands, persona, keys, values, is_training = self.vectorize(observations)
+
         if is_training:
             pred = self.predict(xs, cands, persona, keys, values, ys, is_training)
             batch_reply[0]['text'] = observations[0]['label_candidates'][pred]
