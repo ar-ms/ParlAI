@@ -13,9 +13,13 @@ from projects.convai2.eval_hits import setup_args, eval_hits
 if __name__ == '__main__':
     parser = setup_args()
     parser.set_defaults(
-        model='projects.personachat.kvmemnn.kvmemnn:Kvmemnn',
-        model_file='models:convai2/kvmemnn/model',
-        numthreads=40,
+        model='projects.personachat.kvmemnn.arms:ArmsAgent',
+        model_file='/tmp/persona_self_original_300emb_candemb_2mem_hops_sum',
+        dict_file='/tmp/persona_self_original.dict',
+        embeddingsize=300,
+        #model='projects.personachat.kvmemnn.kvmemnn:Kvmemnn',
+        #model_file='models:convai2/kvmemnn/model',
+        numthreads=50,
     )
     opt = parser.parse_args(print_args=False)
     # build all profile memory models
