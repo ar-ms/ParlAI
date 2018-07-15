@@ -23,10 +23,11 @@ TODO List:
 - More logging (e.g. to files), make things prettier.
 """
 
-from parlai.core.agents import create_agent
+from parlai.core.agents import create_agent, create_agent_from_shared
 from parlai.core.worlds import create_task
 from parlai.core.params import ParlaiParser
 from parlai.core.utils import Timer
+from parlai.core.logs import TensorboardLogger
 from parlai.scripts.build_dict import build_dict, setup_args as setup_dict_args
 import math
 import os
@@ -56,7 +57,12 @@ def setup_args(parser=None):
     train.add_argument('-sval', '--save-after-valid', type='bool',
                        default=False,
                        help='Saves the model to model_file.checkpoint after '
-                            'every validation (default True).')
+                            'every validation (default %(default)s).')
+    train.add_argument('-veps', '--validation-every-n-epochs',
+                       type=int, default=-1,
+                       help='Validate every n epochs. Whenever the the best '
+                            'validation metric is found, saves the model to '
+                            'the model_file path if set.')
     train.add_argument('-vme', '--validation-max-exs',
                        type=int, default=-1,
                        help='max examples to use during validation (default '
@@ -81,6 +87,11 @@ def setup_args(parser=None):
     train.add_argument('-lfc', '--load-from-checkpoint',
                        type='bool', default=False,
                        help='load model from checkpoint if available')
+    train.add_argument('-vshare', '--validation-share-agent', default=False,
+                       help='use a shared copy of the agent for validation. '
+                            'this will eventually default to True, but '
+                            'currently defaults to False.')
+    TensorboardLogger.add_cmdline_args(parser)
     parser = setup_dict_args(parser)
     return parser
 
@@ -96,12 +107,17 @@ def run_eval(agent, opt, datatype, max_exs=-1, write_log=False, valid_world=None
     print('[ running eval: ' + datatype + ' ]')
     if 'stream' in opt['datatype']:
         datatype += ':stream'
-    opt['datatype'] = datatype
-    if opt.get('evaltask'):
-        opt['task'] = opt['evaltask']
 
     if valid_world is None:
-        valid_world = create_task(opt, agent)
+        opt = opt.copy()
+        opt['datatype'] = datatype
+        if opt.get('evaltask'):
+            opt['task'] = opt['evaltask']
+        if opt.get('validation_share_agent', False):
+            valid_agent = create_agent_from_shared(agent.share())
+        else:
+            valid_agent = agent
+        valid_world = create_task(opt, valid_agent)
     valid_world.reset()
     cnt = 0
 
@@ -150,7 +166,7 @@ class TrainLoop():
             if opt['dict_file'] is None and opt.get('model_file'):
                 opt['dict_file'] = opt['model_file'] + '.dict'
             print("[ building dictionary first... ]")
-            build_dict(opt)
+            build_dict(opt, skip_if_built=True)
         # Create model and assign it to the specified task
         self.agent = create_agent(opt)
         self.world = create_task(opt, self.agent)
@@ -167,6 +183,8 @@ class TrainLoop():
         self.log_every_n_secs = opt['log_every_n_secs'] if opt['log_every_n_secs'] > 0 else float('inf')
         self.val_every_n_secs = opt['validation_every_n_secs'] if opt['validation_every_n_secs'] > 0 else float('inf')
         self.save_every_n_secs = opt['save_every_n_secs'] if opt['save_every_n_secs'] > 0 else float('inf')
+        self.val_every_n_epochs = opt['validation_every_n_epochs'] if opt['validation_every_n_epochs'] > 0 else float('inf')
+        self.last_valid_epoch = 0
         self.valid_optim = 1 if opt['validation_metric_mode'] == 'max' else -1
         self.best_valid = None
         if opt.get('model_file') and os.path.isfile(opt['model_file'] + '.best_valid'):
@@ -178,19 +196,39 @@ class TrainLoop():
         self.saved = False
         self.valid_world = None
         self.opt = opt
+        if opt['tensorboard_log'] is True:
+            self.writer = TensorboardLogger(opt)
 
     def validate(self):
         opt = self.opt
+        # run evaluation on valid set
         valid_report, self.valid_world = run_eval(
             self.agent, opt, 'valid', opt['validation_max_exs'],
             valid_world=self.valid_world)
+
+        # logging
+        if opt['tensorboard_log'] is True:
+            self.writer.add_metrics('valid', int(math.floor(self.train_time.time())), valid_report)
+        # saving
         if opt.get('model_file') and opt.get('save_after_valid'):
             print("[ saving model checkpoint: " + opt['model_file'] + ".checkpoint ]")
             self.agent.save(opt['model_file'] + '.checkpoint')
+
+        # send valid metrics to agent if the agent wants them
         if hasattr(self.agent, 'receive_metrics'):
             self.agent.receive_metrics(valid_report)
-        print(valid_report)
-        new_valid = valid_report[opt['validation_metric']]
+        # check which metric to look at
+        if '/' in opt['validation_metric']:
+            # if you are multitasking and want your validation metric to be
+            # a metric specific to a subtask, specify your validation metric
+            # as -vmt subtask/metric
+            subtask = opt['validation_metric'].split('/')[0]
+            validation_metric = opt['validation_metric'].split('/')[1]
+            new_valid = valid_report['tasks'][subtask][validation_metric]
+        else:
+            new_valid = valid_report[opt['validation_metric']]
+
+        # check if this is the best validation so far
         if self.best_valid is None or self.valid_optim * new_valid > self.valid_optim * self.best_valid:
             print('[ new best {}: {}{} ]'.format(
                 opt['validation_metric'], new_valid,
@@ -213,6 +251,8 @@ class TrainLoop():
                     opt['validation_metric'], round(self.best_valid, 4),
                     self.impatience))
         self.validate_time.reset()
+
+        # check if we are out of patience
         if opt['validation_patience'] > 0 and self.impatience >= opt['validation_patience']:
             print('[ ran out of patience! stopping training. ]')
             return True
@@ -229,7 +269,18 @@ class TrainLoop():
 
         # time elapsed
         logs.append('time:{}s'.format(math.floor(self.train_time.time())))
-        logs.append('parleys:{}'.format(self.parleys))
+        total_exs = self.world.get_total_exs()
+        logs.append('total_exs:{}'.format(total_exs))
+
+        exs_per_ep = self.world.num_examples()
+        if exs_per_ep:
+            logs.append('total_epochs:{}'.format(
+                round(total_exs / exs_per_ep, 2)))
+
+        exs_per_ep = self.world.num_examples()
+        if exs_per_ep:
+            logs.append('total_eps:{}'.format(
+                round(self.world.get_total_exs() / exs_per_ep, 2)))
 
         if 'time_left' in train_report:
             logs.append('time_left:{}s'.format(
@@ -241,14 +292,19 @@ class TrainLoop():
         print(log)
         self.log_time.reset()
 
+        if opt['tensorboard_log'] is True:
+            self.writer.add_metrics('train', int(logs[1].split(":")[1]), train_report)
+
     def train(self):
         opt = self.opt
         world = self.world
         with world:
             while True:
+                # do one example / batch of examples
                 world.parley()
                 self.parleys += 1
 
+                # check counters and timers
                 if world.get_total_epochs() >= self.max_num_epochs:
                     self.log()
                     print('[ num_epochs completed:{} time elapsed:{}s ]'.format(
@@ -261,6 +317,11 @@ class TrainLoop():
                     self.log()
                 if self.validate_time.time() > self.val_every_n_secs and (opt.get('numthreads', 1)>1 or world.episode_done()):
                     stop_training = self.validate()
+                    if stop_training:
+                        break
+                if world.get_total_epochs() - self.last_valid_epoch >= self.val_every_n_epochs:
+                    stop_training = self.validate()
+                    self.last_valid_epoch = world.get_total_epochs()
                     if stop_training:
                         break
                 if self.save_time.time() > self.save_every_n_secs and opt.get('model_file'):

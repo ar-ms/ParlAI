@@ -6,12 +6,24 @@
 """Contains code for parsing and building a dictionary from text."""
 
 from .agents import Agent
+from .build_data import make_dir
 from collections import defaultdict
 import argparse
+import codecs
 import copy
 import numpy as np
 import os
+import pickle
+import re
 
+try:
+    from subword_nmt import learn_bpe, apply_bpe
+    # Don't explicitly throw the runtime error unless the user needs it
+    BPE_INSTALLED = True
+except ImportError:
+    BPE_INSTALLED = False
+
+RETOK = re.compile(r'\w+|[^\w\s]|\n', re.UNICODE)
 
 def escape(s):
     """Replace potential special characters with escaped version.
@@ -56,7 +68,6 @@ def find_ngrams(token_dict, text, n):
     saved_tokens.extend(find_ngrams(token_dict, remainder, sub_n))
     return saved_tokens
 
-
 class DictionaryAgent(Agent):
     """Builds and/or loads a dictionary.
 
@@ -74,7 +85,7 @@ class DictionaryAgent(Agent):
     default_start = '__START__'
     default_end = '__END__'
     default_unk = '__UNK__'
-    default_tok = 'split'
+    default_tok = 're'
     default_lower = False
 
     @staticmethod
@@ -126,6 +137,12 @@ class DictionaryAgent(Agent):
             dictionary.add_argument(
                 '--dict-lower', default=DictionaryAgent.default_lower, type='bool',
                 help='Whether or not to lowercase all text seen.')
+            dictionary.add_argument(
+                '--bpe-num-symbols', default=30000, type=int,
+                help='Number of BPE symbols. Recommended between 30000 and 40000')
+            dictionary.add_argument(
+                '--bpe-debug', action='store_true',
+                help='Leave BPE tokens untouched in output. Useful for debugging.')
         except argparse.ArgumentError:
             # already added
             pass
@@ -135,15 +152,21 @@ class DictionaryAgent(Agent):
     def __init__(self, opt, shared=None):
         # initialize fields
         self.opt = copy.deepcopy(opt)
-        self.minfreq = opt['dict_minfreq']
-        self.null_token = opt['dict_nulltoken']
-        self.end_token = opt['dict_endtoken']
-        self.unk_token = opt['dict_unktoken']
-        self.start_token = opt['dict_starttoken']
-        self.max_ngram_size = opt['dict_max_ngram_size']
+        self.minfreq = opt.get('dict_minfreq', DictionaryAgent.default_minfreq)
+        self.null_token = opt.get('dict_nulltoken', DictionaryAgent.default_null)
+        self.end_token = opt.get('dict_endtoken', DictionaryAgent.default_end)
+        self.unk_token = opt.get('dict_unktoken', DictionaryAgent.default_unk)
+        self.start_token = opt.get('dict_starttoken', DictionaryAgent.default_start)
+        self.max_ngram_size = opt.get('dict_max_ngram_size', DictionaryAgent.default_maxngram)
         self.tokenizer = opt.get('dict_tokenizer', DictionaryAgent.default_tok)
         self.lower = opt.get('dict_lower', DictionaryAgent.default_lower)
         self.maxtokens = opt.get('dict_maxtokens', DictionaryAgent.default_maxtokens)
+
+        try:
+            self.tokenizer_fun = getattr(self, self.tokenizer + '_tokenize')
+        except AttributeError:
+            raise AttributeError(
+                'tokenizer type {} not yet supported'.format(self.tokenizer))
 
         if shared:
             self.freq = shared.get('freq', {})
@@ -155,26 +178,19 @@ class DictionaryAgent(Agent):
             self.ind2tok = {}
 
             if self.null_token:
-                self.tok2ind[self.null_token] = 0
-                self.ind2tok[0] = self.null_token
+                self.add_token(self.null_token)
 
             if self.start_token:
                 # set special start of sentence word token
-                index = len(self.tok2ind)
-                self.tok2ind[self.start_token] = index
-                self.ind2tok[index] = self.start_token
+                self.add_token(self.start_token)
 
             if self.end_token:
                 # set special end of sentence word token
-                index = len(self.tok2ind)
-                self.tok2ind[self.end_token] = index
-                self.ind2tok[index] = self.end_token
+                self.add_token(self.end_token)
 
             if self.unk_token:
                 # set special unknown word token
-                index = len(self.tok2ind)
-                self.tok2ind[self.unk_token] = index
-                self.ind2tok[index] = self.unk_token
+                self.add_token(self.unk_token)
 
             if opt.get('dict_file') and os.path.isfile(opt['dict_file']):
                 # load pre-existing dictionary
@@ -207,9 +223,15 @@ class DictionaryAgent(Agent):
                                   'or find alternative installation options '
                                   'at spacy.io')
             self.NLP = spacy.load('en')
+        elif self.tokenizer == 'bpe':
+            if not opt.get('dict_file'):
+                raise RuntimeError('--dict-file is mandatory.')
+            self.bpehelper = _BPEHelper(
+                opt.get('dict_file') + '.codecs',
+                num_symbols=opt.get('bpe_num_symbols'),
+            )
 
         if not shared:
-
             if self.null_token:
                 # fix count for null token to one billion and three
                 self.freq[self.null_token] = 1000000003
@@ -228,6 +250,12 @@ class DictionaryAgent(Agent):
 
             if opt.get('dict_file'):
                 self.save_path = opt['dict_file']
+
+    def add_token(self, word):
+        if word not in self.tok2ind:
+            index = len(self.tok2ind)
+            self.tok2ind[word] = index
+            self.ind2tok[index] = word
 
     def __contains__(self, key):
         """If key is an int, returns whether the key is in the indices.
@@ -263,10 +291,7 @@ class DictionaryAgent(Agent):
         if self.lower:
             key = key.lower()
         self.freq[key] = int(value)
-        if key not in self.tok2ind:
-            index = len(self.tok2ind)
-            self.tok2ind[key] = index
-            self.ind2tok[index] = key
+        self.add_token(key)
 
     def keys(self):
         return self.tok2ind.keys()
@@ -304,11 +329,22 @@ class DictionaryAgent(Agent):
                 for token in self.word_tok.tokenize(sent))
 
     @staticmethod
+    def re_tokenize(text):
+        """Find boundaries between word characters, newlines, and non-word
+        non-whitespace tokens (r'[\w\n]+ | [^\w\s] | \n').
+
+        This splits along whitespace and punctuation and keeps the newline as
+        a token in the returned list.
+        """
+        return RETOK.findall(text)
+
+    @staticmethod
     def split_tokenize(text):
         """Splits tokens based on whitespace after adding whitespace around
         punctuation.
+        Use re_tokenize if you want more robust handling of punctuation.
         """
-        return (text.replace('.', ' . ').replace('. . .', '...')
+        return (text.replace('.', ' . ')
                 .replace(',', ' , ').replace(';', ' ; ').replace(':', ' : ')
                 .replace('!', ' ! ').replace('?', ' ? ')
                 .split())
@@ -334,21 +370,9 @@ class DictionaryAgent(Agent):
         """Returns a sequence of tokens from the iterable."""
         if self.lower:
             text = text.lower()
-        tokenizer = self.tokenizer
-        if tokenizer == 'split':
-            word_tokens = self.split_tokenize(text)
-        elif tokenizer == 'nltk':
-            word_tokens = self.nltk_tokenize(text)
-        elif tokenizer == 'spacy':
-            word_tokens = self.spacy_tokenize(text)
-        else:
-            method_name = str(tokenizer) + '_tokenize'
-            if hasattr(self, method_name):
-                fun = getattr(self, method_name)
-                word_tokens = fun(text)
-            else:
-                raise RuntimeError(
-                    'tokenizer type {} not yet supported'.format(tokenizer))
+
+        # calls the selected tokenizer function e.g. 're' => re_tokenize(text)
+        word_tokens = self.tokenizer_fun(text)
 
         if not building and self.max_ngram_size > 1:
             # search for ngrams during parse-time
@@ -357,14 +381,36 @@ class DictionaryAgent(Agent):
                                       self.max_ngram_size)
         return word_tokens
 
+    def bpe_tokenize(self, text):
+        """Returns a sequence of BPE-tokens from the text."""
+        if self.lower:
+            text = text.lower()
+        return self.bpehelper.tokenize(text)
+
+    def finalize(self):
+        """
+        Finalize and freeze the dictionary.
+
+        If using BPE tokenization, performs the codec learning.
+        """
+
+        if self.tokenizer != 'bpe':
+            # only BPE needs the second pass
+            return
+
+        # Let the BPE model learn its codecs, then use the encodings to
+        # populate the DictionaryAgent. This could be moved to inside the
+        # _BPEHelper, but would require careful accounting to ensure vocabulary
+        # counts are correct.
+        if self.bpehelper.finalize():
+            for line in self.bpehelper.training_data:
+                self.add_to_dict(self.bpehelper.tokenize(line))
+
     def add_to_dict(self, tokens):
         """ Builds dictionary from the list of provided tokens."""
         for token in tokens:
+            self.add_token(token)
             self.freq[token] += 1
-            if token not in self.tok2ind:
-                index = len(self.tok2ind)
-                self.tok2ind[token] = index
-                self.ind2tok[index] = token
 
     def remove_tail(self, min_freq):
         to_remove = []
@@ -393,16 +439,13 @@ class DictionaryAgent(Agent):
         """
         print('Dictionary: loading dictionary from {}'.format(
               filename))
-        with open(filename) as read:
+        with codecs.open(filename, "r",encoding='utf-8', errors='ignore') as read:
             for line in read:
                 split = line.strip().split('\t')
                 token = unescape(split[0])
                 cnt = int(split[1]) if len(split) > 1 else 0
                 self.freq[token] = cnt
-                if token not in self.tok2ind:
-                    index = len(self.tok2ind)
-                    self.tok2ind[token] = index
-                    self.ind2tok[index] = token
+                self.add_token(token)
         print('[ num words =  %d ]' % len(self))
 
     def save(self, filename=None, append=False, sort=True):
@@ -420,19 +463,28 @@ class DictionaryAgent(Agent):
         if sort:
             self.sort()
 
+        make_dir(os.path.dirname(filename))
         with open(filename, 'a' if append else 'w') as write:
             for i in range(len(self.ind2tok)):
                 tok = self.ind2tok[i]
                 cnt = self.freq[tok]
                 write.write('{tok}\t{cnt}\n'.format(tok=escape(tok), cnt=cnt))
 
-    def sort(self):
+        # save opt file
+        with open(filename + '.opt', 'wb') as handle:
+            pickle.dump(self.opt, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def sort(self, trim=True):
         """Sorts the dictionary, so that the elements with the lowest index have
         the highest counts. This reindexes the dictionary according to the
         sorted frequencies, breaking ties alphabetically by token.
+
+        :param bool trim: If True, truncate the dictionary based on minfreq and
+            maxtokens.
         """
         # sort first by count, then alphabetically
-        self.remove_tail(self.minfreq)
+        if trim:
+            self.remove_tail(self.minfreq)
         sorted_pairs = sorted(self.freq.items(), key=lambda x: (-x[1], x[0]))
         new_tok2ind = {}
         new_ind2tok = {}
@@ -441,7 +493,8 @@ class DictionaryAgent(Agent):
             new_ind2tok[i] = tok
         self.tok2ind = new_tok2ind
         self.ind2tok = new_ind2tok
-        self.resize_to_max(self.maxtokens)
+        if trim:
+            self.resize_to_max(self.maxtokens)
         return sorted_pairs
 
     def parse(self, txt_or_vec, vec_type=list):
@@ -450,9 +503,7 @@ class DictionaryAgent(Agent):
         ``vec_type`` is the type of the returned vector if the input is a string.
         """
         if type(txt_or_vec) == str:
-            res = self.txt2vec(txt_or_vec, vec_type)
-            assert type(res) == vec_type
-            return res
+            return self.txt2vec(txt_or_vec, vec_type)
         else:
             return self.vec2txt(txt_or_vec)
 
@@ -463,23 +514,29 @@ class DictionaryAgent(Agent):
 
         ``vec_type`` is the type of the returned vector if the input is a string.
         """
-        if vec_type == np.ndarray:
+        if vec_type == list or vec_type == tuple or vec_type == set:
+            res = vec_type((self[token] for token in self.tokenize(str(text))))
+        elif vec_type == np.ndarray:
             res = np.fromiter(
-                (self[token] for token in self.tokenize(str(text))),
+                (self[token] for token in self.tokenize(text)),
                 np.int
             )
-        elif vec_type == list or vec_type == tuple or vec_type == set:
-            res = vec_type((self[token] for token in self.tokenize(str(text))))
         else:
             raise RuntimeError('Type {} not supported by dict'.format(vec_type))
-        assert type(res) == vec_type
         return res
 
     def vec2txt(self, vector, delimiter=' '):
         """Converts a vector (iterable of ints) into a string, with each token
         separated by the delimiter (default ``' '``).
         """
-        return delimiter.join(self[int(idx)] for idx in vector)
+        text = delimiter.join(self[int(idx)] for idx in vector)
+        # if we used a BPE tokenizer we need to rejoin the encodings
+        if self.tokenizer == 'bpe' and not self.opt.get('bpe_debug', False):
+            text = text.replace('@@ ', '')
+            # It's also possible that we get a BPE encoding on the end of the word
+            if text.endswith('@@'):
+                text = text[:-2]
+        return text
 
     def act(self):
         """Add any words passed in the 'text' field of the observation to this
@@ -509,3 +566,96 @@ class DictionaryAgent(Agent):
 
     def __str__(self):
         return str(self.freq)
+
+
+class _BPEHelper(object):
+    """
+    Helper class for performing BPE subword tokenization.
+    For technical details, please refer to https://arxiv.org/abs/1508.07909.
+    This class just wraps around the official subword-nmt repository.
+
+    This API expects the user to call tokenize() onto the training data,
+    then call finalize() to learn the encodings, and then iterate over the data
+    in a second pass, calling tokenize() again to get processed output.
+    """
+
+    def __init__(self, codecs_filename, num_symbols=30000, minfreq=2):
+        """
+        Initialize the BPE module.
+        If `codecs_filename` already exists, loads the pretrained codecs.
+        If it does not, codecs will be saved there after a call to `finalize()`.
+
+        :param codecs_filename: place to save/load codecs.
+        :param num_symbols: Number of BPE symbols. Recommend 30000-40000.
+        :param minfreq: Minimum frequency of a token before forced BPE decomposition.
+        """
+        if not BPE_INSTALLED:
+            raise RuntimeError(
+                "Please run \"pip install 'git+https://github.com/rsennrich"
+                "/subword-nmt.git#egg=subword-nmt'\""
+            )
+
+        self.codecs = codecs_filename
+        if os.path.exists(self.codecs):
+            self.built = True
+            self._load_from_codecs()
+        else:
+            self.num_symbols = num_symbols
+            self.minfreq = minfreq
+            self.training_data = []
+            self.built = False
+
+    def _load_from_codecs(self):
+        with open(self.codecs, 'r') as codecs_file:
+            self.bpe = apply_bpe.BPE(codecs_file)
+
+    def _add_to_train(self, tokens):
+        """
+        Queues up all the data to learn the BPE tokenizer.
+
+        :param tokens: list[str]. Initial tokenization approximation.
+        """
+        if self.built:
+            raise RuntimeError("BPE dictionary has been finalized.")
+        self.training_data.append(" ".join(tokens) + "\n")
+        return []
+
+    def tokenize(self, text):
+        """
+        Tokenizes the text if codecs are already finalized.
+        Otherwise, stores data for learning codecs.
+
+        :param text: str. Raw text to tokenize.
+        :return: a list of tokens. List will be empty if not tokenized.
+        """
+        tokens = DictionaryAgent.re_tokenize(text)
+        if self.built:
+            return self._apply(tokens)
+        else:
+            return self._add_to_train(tokens)
+
+    def _apply(self, tokens):
+        return self.bpe.segment_tokens(tokens)
+
+    def finalize(self):
+        """Build the codecs"""
+        if self.built:
+            return False
+
+        self.built = True
+
+        with open(self.codecs, 'w') as outstream:
+            # There's a potentially more memory efficient way to do this, with
+            # the is_dict method able to handle <word> \t <count> format.
+            # It will require more sophisticated marshalling of data back and
+            # forth
+            learn_bpe.learn_bpe(
+                self.training_data,
+                outstream,
+                num_symbols=self.num_symbols,
+                min_frequency=self.minfreq,
+                is_dict=False,
+            )
+
+        self._load_from_codecs()
+        return True

@@ -38,8 +38,9 @@ if __name__ == '__main__':
         validation_metric='accuracy',
         validation_metric_mode='max',
         validation_patience=-1,
-        validation_max_examples=1000,
-        log_every_n_secs=60,
-        numthreads=50,
+        validation_max_examples=100000,
+        log_every_n_secs=10,
+        numthreads=40,
+        dict_tokenizer='split',
     )
     TrainLoop(parser.parse_args()).train()

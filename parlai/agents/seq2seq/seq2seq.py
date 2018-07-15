@@ -5,6 +5,7 @@
 # of patent rights can be found in the PATENTS file in the same directory.
 
 from parlai.core.agents import Agent
+from parlai.core.build_data import modelzoo_path
 from parlai.core.dict import DictionaryAgent
 from parlai.core.utils import maintain_dialog_history, PaddingUtils, round_sigfigs
 from parlai.core.thread_utils import SharedTable
@@ -14,12 +15,14 @@ import torch
 from torch.autograd import Variable
 from torch import optim
 import torch.nn as nn
+import torch.nn.functional as F
 
-from collections import deque
+from collections import deque, defaultdict
 
 import os
 import math
 import pickle
+
 
 class Seq2seqAgent(Agent):
     """Agent which takes an input sequence and produces an output sequence.
@@ -71,7 +74,7 @@ class Seq2seqAgent(Agent):
                            help='learning rate')
         agent.add_argument('-dr', '--dropout', type=float, default=0.1,
                            help='dropout rate')
-        agent.add_argument('-clip', '--gradient-clip', type=float, default=-1,
+        agent.add_argument('-clip', '--gradient-clip', type=float, default=0.1,
                            help='gradient clipping using l2 norm')
         agent.add_argument('-bi', '--bidirectional', type='bool',
                            default=False,
@@ -90,12 +93,13 @@ class Seq2seqAgent(Agent):
                                 'decoding.')
         agent.add_argument('--no-cuda', action='store_true', default=False,
                            help='disable GPUs even if available')
-        agent.add_argument('--gpu', type=int, default=-1,
+        agent.add_argument('-gpu', '--gpu', type=int, default=-1,
                            help='which GPU device to use')
+        # ranking arguments
         agent.add_argument('-rc', '--rank-candidates', type='bool',
                            default=False,
                            help='rank candidates if available. this is done by'
-                                ' computing the mean score per token for each '
+                                ' computing the prob score per token for each '
                                 'candidate and selecting the highest scoring.')
         agent.add_argument('-tr', '--truncate', type=int, default=-1,
                            help='truncate input & output lengths to speed up '
@@ -134,7 +138,8 @@ class Seq2seqAgent(Agent):
                                 'if > 0, sgd uses nesterov momentum.')
         agent.add_argument('-emb', '--embedding-type', default='random',
                            choices=['random', 'glove', 'glove-fixed',
-                                    'fasttext', 'fasttext-fixed'],
+                                    'fasttext', 'fasttext-fixed',
+                                    'glove-twitter'],
                            help='Choose between different strategies '
                                 'for word embeddings. Default is random, '
                                 'but can also preinitialize from Glove or '
@@ -151,19 +156,27 @@ class Seq2seqAgent(Agent):
                            choices=['none', 'model', 'label',
                                     'label_else_model'],
                            help='Keep replies in the history, or not.')
+        agent.add_argument('-pt', '--person-tokens', type='bool', default=False,
+                           help='use special tokens before each speaker')
+        agent.add_argument('--beam-size', type=int, default=1, help='Beam size, if 1 then greedy search')
+        agent.add_argument('--beam-log-freq', type=float, default=0.0,
+                           help='The portion of beams to dump from minibatch into model_name.beam_dump folder')
         Seq2seqAgent.dictionary_class().add_cmdline_args(argparser)
         return agent
 
     def __init__(self, opt, shared=None):
-        """Set up model if shared params not set, otherwise no work to do."""
+        """Set up model."""
         super().__init__(opt, shared)
         opt = self.opt  # there is a deepcopy in the init
 
         # all instances may need some params
         self.truncate = opt['truncate'] if opt['truncate'] > 0 else None
-        self.metrics = {'loss': 0.0, 'num_tokens': 0}
+        self.metrics = {'loss': 0.0, 'num_tokens': 0, 'correct_tokens': 0, 'total_skipped_batches': 0}
         self.history = {}
         self.report_freq = opt.get('report_freq', 0.001)
+        self.use_person_tokens = opt.get('person_tokens', False)
+        self.batch_idx = shared and shared.get('batchindex') or 0
+        self.rank = opt['rank_candidates']
         states = {}
 
         # check for cuda
@@ -181,12 +194,10 @@ class Seq2seqAgent(Agent):
             self.NULL_IDX = shared['NULL_IDX']
             # answers contains a batch_size list of the last answer produced
             self.answers = shared['answers']
+            self.model = shared['model']
+            self.metrics = shared['metrics']
+            states = shared.get('states', {})
 
-            if 'model' in shared:
-                # model is shared during hogwild
-                self.model = shared['model']
-                self.metrics = shared['metrics']
-                states = shared['states']
         else:
             # this is not a shared instance of this class, so do full init
             # answers contains a batch_size list of the last answer produced
@@ -207,11 +218,11 @@ class Seq2seqAgent(Agent):
             if init_model is not None:
                 # load model parameters if available
                 print('[ Loading existing model params from {} ]'.format(init_model))
-                states = self.load(opt['model_file'])
+                states = self.load(init_model)
 
-            if ((init_model is not None and os.path.isfile(init_model + '.dict'))
-                or opt['dict_file'] is None):
-                opt['dict_file'] = init_model + '.dict'
+                if os.path.isfile(init_model + '.dict') or opt['dict_file'] is None:
+                    opt['dict_file'] = init_model + '.dict'
+
             # load dictionary and basic tokens & vectors
             self.dict = DictionaryAgent(opt)
             self.id = 'Seq2Seq'
@@ -222,6 +233,9 @@ class Seq2seqAgent(Agent):
             # get index of null token from dictionary (probably 0)
             self.NULL_IDX = self.dict[self.dict.null_token]
 
+            # search
+            self.beam_size = opt.get('beam_size', 1)
+
             if not hasattr(self, 'model_class'):
                 # this allows child classes to override this but inherit init
                 self.model_class = Seq2seq
@@ -230,41 +244,37 @@ class Seq2seqAgent(Agent):
                 start_idx=self.START_IDX, end_idx=self.END_IDX,
                 longest_label=states.get('longest_label', 1))
 
-            if opt['embedding_type'] != 'random':
+            if not states and opt['embedding_type'] != 'random':
                 # set up preinitialized embeddings
                 try:
                     import torchtext.vocab as vocab
-                except ModuleNotFoundError as ex:
+                except ImportError as ex:
                     print('Please install torch text with `pip install torchtext`')
                     raise ex
+                pretrained_dim = 300
                 if opt['embedding_type'].startswith('glove'):
-                    init = 'glove'
-                    embs = vocab.GloVe(
-                        name='840B',
-                        dim=300,
-                        cache=os.path.join(
-                            opt['parlai_home'],
-                            'data',
-                            'models',
-                            'glove_vectors'
-                        )
+                    if 'twitter' in opt['embedding_type']:
+                        init = 'glove-twitter'
+                        name = 'twitter.27B'
+                        pretrained_dim = 200
+                    else:
+                        init = 'glove'
+                        name = '840B'
+                    embs = vocab.GloVe(name=name, dim=pretrained_dim,
+                        cache=modelzoo_path(self.opt.get('datapath'),
+                                            'models:glove_vectors')
                     )
                 elif opt['embedding_type'].startswith('fasttext'):
                     init = 'fasttext'
-                    embs = vocab.FastText(
-                        language='en',
-                        cache=os.path.join(
-                            opt['parlai_home'],
-                            'data',
-                            'models',
-                            'fasttext_vectors'
-                        )
+                    embs = vocab.FastText(language='en',
+                        cache=modelzoo_path(self.opt.get('datapath'),
+                                            'models:fasttext_vectors')
                     )
                 else:
                     raise RuntimeError('embedding type not implemented')
 
-                if opt['embeddingsize'] != 300:
-                    rp = torch.Tensor(300, opt['embeddingsize']).normal_()
+                if opt['embeddingsize'] != pretrained_dim:
+                    rp = torch.Tensor(pretrained_dim, opt['embeddingsize']).normal_()
                     t = lambda x: torch.mm(x.unsqueeze(0), rp)
                 else:
                     t = lambda x: x
@@ -287,32 +297,21 @@ class Seq2seqAgent(Agent):
             if self.use_cuda:
                 self.model.cuda()
 
-        if hasattr(self, 'model'):
-            # if model was built, do more setup
+        # set up criteria
+        if opt.get('numsoftmax', 1) > 1:
+            self.criterion = nn.NLLLoss(
+                ignore_index=self.NULL_IDX, size_average=False)
+        else:
+            self.criterion = nn.CrossEntropyLoss(
+                ignore_index=self.NULL_IDX, size_average=False)
+
+        if self.use_cuda:
+            self.criterion.cuda()
+
+        if 'train' in opt.get('datatype', ''):
+            # we only set up optimizers when training
+            # we only set this up for the original instance or hogwild ones
             self.clip = opt.get('gradient_clip', -1)
-            self.rank = opt['rank_candidates']
-
-            # set up tensors once
-            self.xs = torch.LongTensor(1, 1)
-            self.ys = torch.LongTensor(1, 1)
-            if self.rank:
-                self.cands = torch.LongTensor(1, 1, 1)
-
-            # set up criteria
-            if opt.get('numsoftmax', 1) > 1:
-                self.criterion = nn.NLLLoss(
-                    ignore_index=self.NULL_IDX, size_average=False)
-            else:
-                self.criterion = nn.CrossEntropyLoss(
-                    ignore_index=self.NULL_IDX, size_average=False)
-
-            if self.use_cuda:
-                # push to cuda
-                self.xs = self.xs.cuda()
-                self.ys = self.ys.cuda()
-                if self.rank:
-                    self.cands = self.cands.cuda()
-                self.criterion.cuda()
 
             # set up optimizer
             lr = opt['learningrate']
@@ -338,7 +337,11 @@ class Seq2seqAgent(Agent):
                     print('WARNING: not loading optim state since optim class '
                           'changed.')
                 else:
-                    self.optimizer.load_state_dict(states['optimizer'])
+                    try:
+                        self.optimizer.load_state_dict(states['optimizer'])
+                    except ValueError:
+                        print('WARNING: not loading optim state since model '
+                              'params changed.')
                     if self.use_cuda:
                         for state in self.optimizer.state.values():
                             for k, v in state.items():
@@ -404,12 +407,15 @@ class Seq2seqAgent(Agent):
         """Reset observation and episode_done."""
         self.observation = None
         self.history.clear()
+        for i in range(len(self.answers)):
+            self.answers[i] = None
         self.reset_metrics()
 
     def reset_metrics(self):
         """Reset metrics for reporting loss and perplexity."""
         self.metrics['loss'] = 0.0
         self.metrics['num_tokens'] = 0
+        self.metrics['correct_tokens'] = 0
 
     def report(self):
         """Report loss and perplexity from model's perspective.
@@ -418,12 +424,17 @@ class Seq2seqAgent(Agent):
         differ from a truly independent measurement.
         """
         m = {}
-        if self.metrics['num_tokens'] > 0:
-            m['loss'] = self.metrics['loss'] / self.metrics['num_tokens']
+        num_tok = self.metrics['num_tokens']
+        if num_tok > 0:
+            if self.metrics['correct_tokens'] > 0:
+                m['token_acc'] = self.metrics['correct_tokens'] / num_tok
+            m['loss'] = self.metrics['loss'] / num_tok
             try:
                 m['ppl'] = math.exp(m['loss'])
             except OverflowError:
                 m['ppl'] = float('inf')
+        if self.metrics['total_skipped_batches'] > 0:
+            m['total_skipped_batches'] = self.metrics['total_skipped_batches']
         for k, v in m.items():
             # clean up: rounds to sigfigs and converts tensors to floats
             m[k] = round_sigfigs(v, 4)
@@ -438,18 +449,17 @@ class Seq2seqAgent(Agent):
         shared['START_IDX'] = self.START_IDX
         shared['END_IDX'] = self.END_IDX
         shared['NULL_IDX'] = self.NULL_IDX
+        shared['model'] = self.model
         if self.opt.get('numthreads', 1) > 1:
             # we're doing hogwild so share the model too
             if type(self.metrics) == dict:
                 # move metrics and model to shared memory
                 self.metrics = SharedTable(self.metrics)
                 self.model.share_memory()
-        shared['metrics'] = self.metrics
-        shared['model'] = self.model
-        shared['states'] = {  # only need to pass optimizer states
-            'optimizer': self.optimizer.state_dict(),
-            'optimizer_type': self.opt['optimizer'],
-        }
+            shared['states'] = {  # don't share optimizer states
+                'optimizer_type': self.opt['optimizer'],
+            }
+        shared['metrics'] = self.metrics  # do after numthreads check
         return shared
 
     def observe(self, observation):
@@ -458,19 +468,20 @@ class Seq2seqAgent(Agent):
         """
         # shallow copy observation (deep copy can be expensive)
         obs = observation.copy()
-        batch_idx = self.opt.get('batchindex', 0)
+
+
         if not obs.get('preprocessed', False) or 'text2vec' not in obs:
             obs['text2vec'] = maintain_dialog_history(
                 self.history, obs,
-                reply=self.answers[batch_idx],
+                reply=self.answers[self.batch_idx],
                 historyLength=self.truncate,
                 useReplies=self.opt.get('history_replies'),
                 dict=self.dict,
-                useStartEndIndices=False)
+                useStartEndIndices=self.use_person_tokens)
         else:
             obs['text2vec'] = deque(obs['text2vec'], maxlen=self.truncate)
         self.observation = obs
-        self.answers[batch_idx] = None
+        self.answers[self.batch_idx] = None
         return obs
 
     def predict(self, xs, ys=None, cands=None, valid_cands=None, is_training=False):
@@ -479,26 +490,42 @@ class Seq2seqAgent(Agent):
         Update the model using the targets if available, otherwise rank
         candidates as well if they are available and param is set.
         """
-        text_cand_inds = None
+        predictions, cand_preds = None, None
         if is_training:
             self.model.train()
             self.zero_grad()
-            out = self.model(xs, ys)
-            predictions, scores = out[0], out[1]
-            score_view = scores.view(-1, scores.size(-1))
-            loss = self.criterion(score_view, ys.view(-1))
-            # save loss to metrics
-            target_tokens = ys.ne(self.NULL_IDX).long().sum().item()
-            self.metrics['loss'] += loss.item()
-            self.metrics['num_tokens'] += target_tokens
-            loss /= target_tokens  # average loss per token
-            # loss /= xs.size(0)  # average loss per sentence
-            loss.backward()
+            out = None
+            try:
+                out = self.model(xs, ys, rank_during_training=cands is not None)
+                # generated response
+                _preds, scores, cand_preds = out[0], out[1], out[2]
+
+                score_view = scores.view(-1, scores.size(-1))
+                loss = self.criterion(score_view, ys.view(-1))
+                # save loss to metrics
+                y_ne = ys.ne(self.NULL_IDX)
+                target_tokens = y_ne.long().sum().item()
+                correct = ((ys == _preds) * y_ne).sum().item()
+                self.metrics['correct_tokens'] += correct
+                self.metrics['loss'] += loss.item()
+                self.metrics['num_tokens'] += target_tokens
+                loss /= target_tokens  # average loss per token
+                loss.backward()
+            except RuntimeError as e:
+                # catch out of memory exceptions during fwd/bck (skip batch)
+                if 'out of memory' in str(e):
+                    print('| WARNING: ran out of memory, skipping batch. '
+                          'if this happens frequently, decrease batchsize or '
+                          'truncate the inputs to the model.')
+                    self.metrics['total_skipped_batches'] += 1
+                    return predictions, cand_preds
+                else:
+                    raise e
             self.update_params()
         else:
             self.model.eval()
-            out = self.model(xs, ys=None, cands=cands, valid_cands=valid_cands)
-            predictions, text_cand_inds = out[0], out[2]
+            out = self.model(xs, ys=None, cands=cands, valid_cands=valid_cands, beam_size=self.beam_size)
+            predictions, cand_preds = out[0], out[2]
 
             if ys is not None:
                 # calculate loss on targets
@@ -506,11 +533,12 @@ class Seq2seqAgent(Agent):
                 scores = out[1]
                 score_view = scores.view(-1, scores.size(-1))
                 loss = self.criterion(score_view, ys.view(-1))
+                # save loss to metrics
                 target_tokens = ys.ne(self.NULL_IDX).long().sum().item()
                 self.metrics['loss'] += loss.item()
                 self.metrics['num_tokens'] += target_tokens
 
-        return predictions, text_cand_inds
+        return predictions, cand_preds
 
     def vectorize(self, observations):
         """Convert a list of observations into input & target tensors."""
@@ -526,58 +554,51 @@ class Seq2seqAgent(Agent):
             ys = torch.LongTensor(ys)
         if self.use_cuda:
             # copy to gpu
-            self.xs.resize_(xs.size())
-            self.xs.copy_(xs)
-            xs = Variable(self.xs)
+            xs = xs.cuda()
             if ys is not None:
-                self.ys.resize_(ys.size())
-                self.ys.copy_(ys)
-                ys = Variable(self.ys)
-        else:
-            xs = Variable(xs)
-            if ys is not None:
-                ys = Variable(ys)
+                ys = ys.cuda()
 
-        # set up candidates
         cands = None
         valid_cands = None
         if not is_training and self.rank:
-            # only do ranking when no targets available and ranking flag set
-            parsed_cs = []
+            # set up candidates
+            cands = []
             valid_cands = []
             for i, v in enumerate(valid_inds):
                 if 'label_candidates' in observations[v]:
-                    # each candidate tuple is a pair of the parsed version and
-                    # the original full string
-                    cs = list(observations[v]['label_candidates'])
-                    curr_dqs = [deque(maxlen=self.truncate) for _ in cs]
-                    for dq, c in zip(curr_dqs, cs):
-                        dq.extendleft(reversed(self.parse(c)))
-                    parsed_cs.append(curr_dqs)
-                    valid_cands.append((i, v, cs))
-            if len(parsed_cs) > 0:
-                # TODO: store lengths of cands separately, so don't have zero
-                #       padding for varying number of cands per example
-                # found cands, pack them into tensor
-                max_c_len = max(max(len(c) for c in cs) for cs in parsed_cs)
-                max_c_cnt = max(len(cs) for cs in parsed_cs)
-                for cs in parsed_cs:
-                    for c in cs:
-                        c += [self.NULL_IDX] * (max_c_len - len(c))
-                    cs += [[self.NULL_IDX] * max_c_len] * (max_c_cnt - len(cs))
-                cands = torch.LongTensor(parsed_cs)
-                if self.use_cuda:
-                    # copy to gpu
-                    self.cands.resize_(cands.size())
-                    self.cands.copy_(cands)
-                    cands = Variable(self.cands)
-                else:
-                    cands = Variable(cands)
+                    curr_lcs = list(observations[v]['label_candidates'])
+                    curr_cands = [{'text': c} for c in curr_lcs]
+                    cs, _, _, valid_c_inds, *_ = PaddingUtils.pad_text(curr_cands, self.dict, null_idx=self.NULL_IDX, dq=True, truncate=self.truncate)
+                    valid_cands.append((i, v, [curr_lcs[j] for j in valid_c_inds]))
+                    cs = torch.LongTensor(cs)
+                    if self.use_cuda:
+                        cs = cs.cuda()
+                    cands.append(cs)
 
         return xs, ys, labels, valid_inds, cands, valid_cands, is_training
 
+    def init_cuda_buffer(self, batchsize):
+        if self.use_cuda and not hasattr(self, 'buffer_initialized'):
+            try:
+                print('preinitializing pytorch cuda buffer')
+                bsz = self.opt.get('batchsize', batchsize)
+                maxlen = self.truncate or 180
+                dummy = torch.ones(bsz, maxlen).long().cuda()
+                sc = self.model(dummy, dummy)[1]
+                loss = self.criterion(sc.view(-1, sc.size(-1)), dummy.view(-1))
+                loss.backward()
+                self.buffer_initialized = True
+            except RuntimeError as e:
+                if 'out of memory' in str(e):
+                    m = ('CUDA OOM: Lower batch size (-bs) from {} or lower max'
+                         ' sequence length (-tr) from {}'.format(bsz, maxlen))
+                    raise RuntimeError(m)
+                else:
+                    raise e
+
     def batch_act(self, observations):
         batchsize = len(observations)
+        self.init_cuda_buffer(batchsize)
         # initialize a table of replies with this agent's id
         batch_reply = [{'id': self.getID()} for _ in range(batchsize)]
 
@@ -592,21 +613,24 @@ class Seq2seqAgent(Agent):
             return batch_reply
 
         # produce predictions, train on targets if availables
-        predictions, text_cand_inds = self.predict(xs, ys, cands, valid_cands, is_training)
+        cand_inds = [i[0] for i in valid_cands] if valid_cands is not None else None
+        predictions, cand_preds = self.predict(xs, ys, cands, cand_inds, is_training)
 
         if is_training:
             report_freq = 0
         else:
             report_freq = self.report_freq
-        PaddingUtils.map_predictions(
-            predictions.cpu().data, valid_inds, batch_reply, observations,
-            self.dict, self.END_IDX, report_freq=report_freq, labels=labels,
-            answers=self.answers, ys=ys.data if ys is not None else None)
+        if predictions is not None:
+            PaddingUtils.map_predictions(
+                predictions, valid_inds, batch_reply, observations,
+                self.dict, self.END_IDX, report_freq=report_freq, labels=labels,
+                answers=self.answers, ys=ys.data if ys is not None else None)
 
-        if text_cand_inds is not None:
-            text_cand_inds = text_cand_inds.cpu().data
+        if cand_preds is not None:
+            if valid_cands is None:
+                valid_cands = [(None, i, labels) for i in valid_inds]
             for i in range(len(valid_cands)):
-                order = text_cand_inds[i]
+                order = cand_preds[i]
                 _, batch_idx, curr_cands = valid_cands[i]
                 curr = batch_reply[batch_idx]
                 curr['text_candidates'] = [curr_cands[idx] for idx in order
@@ -659,3 +683,59 @@ class Seq2seqAgent(Agent):
         """Use the metrics to decide when to adjust LR schedule."""
         if 'loss' in metrics_dict:
             self.scheduler.step(metrics_dict['loss'])
+
+
+class mydefaultdict(defaultdict):
+    """Custom defaultdict which overrides defaults requested by the get
+    function with the default factory.
+    """
+    def get(self, key, default=None):
+        # override default from "get" (like "__getitem__" already is)
+        return super().get(key, self.default_factory())
+
+
+class PerplexityEvaluatorAgent(Seq2seqAgent):
+    """Subclass for doing standardized perplexity evaluation.
+
+    This is designed to be used in conjunction with the PerplexityWorld at
+    parlai/scripts/eval_ppl.py. It uses the `next_word_probability` function
+    to calculate the probability of tokens one token at a time.
+    """
+
+    def __init__(self, opt, shared=None):
+        super().__init__(opt, shared)
+        self.prev_enc = None
+
+    def next_word_probability(self, partial_out):
+        """Return probability distribution over next words given an input and
+        partial true output. This is used to calculate the per-word perplexity.
+
+        Arguments:
+        observation -- input observation dict
+        partial_out -- list of previous "true" words
+
+        Returns a dict, where each key is a word and each value is a probability
+        score for that word. Unset keys assume a probability of zero.
+
+        e.g.
+        {'text': 'Run test program.'}, ['hello'] => {'world': 1.0}
+        """
+        obs = self.observation
+        obs['eval_labels'] = [' '.join(partial_out)]
+        batch = self.vectorize([obs])
+        if self.prev_enc is not None and batch[0].shape[1] != self.prev_enc[0].shape[1]:
+            self.prev_enc = None  # reset prev_enc
+
+        self.model.eval()
+        self.model.longest_label = 1  # no need to predict farther ahead
+        out = self.model(
+            batch[0], # xs
+            ys=(batch[1] if len(partial_out) > 0 else None),
+            prev_enc=self.prev_enc)
+        scores, self.prev_enc = out[1], out[-1]
+        # scores is bsz x seqlen x num_words, so select probs of current index
+        probs = F.softmax(scores.select(1, -1), dim=1).squeeze()
+        dist = mydefaultdict(lambda: 1e-7)  # default probability for any token
+        for i in range(len(probs)):
+            dist[self.dict[i]] = probs[i].item()
+        return dist

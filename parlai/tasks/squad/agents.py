@@ -4,9 +4,10 @@
 # LICENSE file in the root directory of this source tree. An additional grant
 # of patent rights can be found in the PATENTS file in the same directory.
 
-from parlai.core.teachers import FixedDialogTeacher, DialogTeacher
+from parlai.core.teachers import FixedDialogTeacher, DialogTeacher, ParlAIDialogTeacher
 from .build import build
 
+import copy
 import json
 import os
 
@@ -115,6 +116,39 @@ class DefaultTeacher(DialogTeacher):
                     yield (context + '\n' + question, answers), True
 
 
+class OpenSquadTeacher(DialogTeacher):
+    """This version of SQuAD inherits from the core Dialog Teacher, which just
+    requires it to define an iterator over its data `setup_data` in order to
+    inherit basic metrics, a default `act` function.
+    Note: This teacher omits the context paragraph
+    """
+
+    def __init__(self, opt, shared=None):
+        self.datatype = opt['datatype']
+        build(opt)
+        if opt['datatype'].startswith('train'):
+            suffix = 'train'
+        else:
+            suffix = 'dev'
+        opt['datafile'] = os.path.join(opt['datapath'], 'SQuAD',
+                                       suffix + '-v1.1.json')
+        self.id = 'squad'
+        super().__init__(opt, shared)
+
+    def setup_data(self, path):
+        print('loading: ' + path)
+        with open(path) as data_file:
+            self.squad = json.load(data_file)['data']
+        for article in self.squad:
+            # each paragraph is a context for the attached questions
+            for paragraph in article['paragraphs']:
+                # each question is an example
+                for qa in paragraph['qas']:
+                    question = qa['question']
+                    answers = (a['text'] for a in qa['answers'])
+                    yield (question, answers), True
+
+
 class TitleTeacher(DefaultTeacher):
     """This version of SquAD inherits from the Default Teacher. The only
     difference is that the 'text' field of an observation will contain
@@ -128,6 +162,7 @@ class TitleTeacher(DefaultTeacher):
 
     def __init__(self, opt, shared=None):
         self.id = 'squad_title'
+        build(opt)
         super().__init__(opt, shared)
 
     def setup_data(self, path):
@@ -147,3 +182,198 @@ class TitleTeacher(DefaultTeacher):
                         '\n'.join([title, context, question]),
                         answers
                     ), True
+
+
+class FulldocTeacher(ParlAIDialogTeacher):
+    def __init__(self, opt, shared=None):
+        build(opt)
+        opt = copy.deepcopy(opt)
+        if opt['datatype'].startswith('train'):
+            suffix = 'train'
+        else:
+            suffix = 'valid'
+        datafile = os.path.join(opt['datapath'],
+                                'SQuAD-fulldoc',
+                                "squad_fulldocs." + suffix + ":ordered")
+        opt['parlaidialogteacher_datafile'] = datafile
+        super().__init__(opt, shared)
+        self.id = 'squad-fulldoc'
+        self.reset()
+
+
+class SentenceIndexTeacher(IndexTeacher):
+    """Index teacher where the labels are the sentences the contain the true
+    answer.
+    """
+    def __init__(self, opt, shared=None):
+        super().__init__(opt, shared)
+
+        try:
+            import nltk
+        except ImportError:
+            raise ImportError('Please install nltk (e.g. pip install nltk).')
+        # nltk-specific setup
+        st_path = 'tokenizers/punkt/{0}.pickle'.format('english')
+        try:
+            self.sent_tok = nltk.data.load(st_path)
+        except LookupError:
+            nltk.download('punkt')
+            self.sent_tok = nltk.data.load(st_path)
+
+    def get(self, episode_idx, entry_idx=None):
+        article_idx, paragraph_idx, qa_idx = self.examples[episode_idx]
+        article = self.squad[article_idx]
+        paragraph = article['paragraphs'][paragraph_idx]
+        qa = paragraph['qas'][qa_idx]
+        context = paragraph['context']
+        question = qa['question']
+
+        answers = [a['text'] for a in qa['answers']]
+
+        # temporarily remove '.', '?', '!' from answers for proper sentence
+        # tokenization
+        edited_answers = []
+        for answer in answers:
+            new_answer = answer.replace(
+                '.', '').replace('?', '').replace('!', '')
+            context = context.replace(answer, new_answer)
+            edited_answers.append(new_answer)
+
+        edited_sentences = self.sent_tok.tokenize(context)
+        sentences = []
+
+        for sentence in edited_sentences:
+            for i in range(len(edited_answers)):
+                sentence = sentence.replace(edited_answers[i], answers[i])
+                sentences.append(sentence)
+
+        for i in range(len(edited_answers)):
+            context = context.replace(edited_answers[i], answers[i])
+
+        labels = []
+        label_starts = []
+        for sentence in sentences:
+            for answer in answers:
+                if answer in sentence and sentence not in labels:
+                    labels.append(sentence)
+                    label_starts.append(context.index(sentence))
+                    break
+
+        action = {
+            'id': 'squad',
+            'text': context + '\n' + question,
+            'labels': labels,
+            'episode_done': True,
+            'answer_starts': label_starts
+        }
+        return action
+
+
+class SentenceIndexEditTeacher(SentenceIndexTeacher):
+    """Index teacher where the labels are the sentences the contain the true
+    answer.
+
+    Some punctuation may be removed from the context and the answer for
+    tokenization purposes.
+    """
+    def __init__(self, opt, shared=None):
+        super().__init__(opt, shared)
+
+    def get(self, episode_idx, entry_idx=None):
+        article_idx, paragraph_idx, qa_idx = self.examples[episode_idx]
+        article = self.squad[article_idx]
+        paragraph = article['paragraphs'][paragraph_idx]
+        qa = paragraph['qas'][qa_idx]
+        context = paragraph['context']
+        question = qa['question']
+
+        answers = [a['text'] for a in qa['answers']]
+
+        # remove '.', '?', '!' from answers for proper sentence
+        # tokenization
+        edited_answers = []
+        for answer in answers:
+            new_answer = answer.replace(
+                '.', '').replace('?', '').replace('!', '')
+            context = context.replace(answer, new_answer)
+            edited_answers.append(new_answer)
+
+        edited_sentences = self.sent_tok.tokenize(context)
+
+        labels = []
+        label_starts = []
+        for sentence in edited_sentences:
+            for answer in edited_answers:
+                if answer in sentence and sentence not in labels:
+                    labels.append(sentence)
+                    label_starts.append(context.index(sentence))
+                    break
+
+        action = {
+            'id': 'squad',
+            'text': context + '\n' + question,
+            'labels': labels,
+            'episode_done': True,
+            'answer_starts': label_starts
+        }
+        return action
+
+
+class SentenceLabelsTeacher(IndexTeacher):
+    """Teacher which contains the question as the text, the sentences as the
+    label candidates, and the label as the sentence containing the answer.
+
+    Some punctuation may be removed for tokenization purposes.
+    """
+    def __init__(self, opt, shared=None):
+        super().__init__(opt, shared)
+
+        try:
+            import nltk
+        except ImportError:
+            raise ImportError('Please install nltk (e.g. pip install nltk).')
+        # nltk-specific setup
+        st_path = 'tokenizers/punkt/{0}.pickle'.format('english')
+        try:
+            self.sent_tok = nltk.data.load(st_path)
+        except LookupError:
+            nltk.download('punkt')
+            self.sent_tok = nltk.data.load(st_path)
+
+    def get(self, episode_idx, entry_idx=None):
+        article_idx, paragraph_idx, qa_idx = self.examples[episode_idx]
+        article = self.squad[article_idx]
+        paragraph = article['paragraphs'][paragraph_idx]
+        qa = paragraph['qas'][qa_idx]
+        context = paragraph['context']
+        question = qa['question']
+
+        answers = [a['text'] for a in qa['answers']]
+
+        # remove '.', '?', '!' from answers for proper sentence
+        # tokenization
+        edited_answers = []
+        for answer in answers:
+            new_answer = answer.replace(
+                '.', '').replace('?', '').replace('!', '')
+            context = context.replace(answer, new_answer)
+            edited_answers.append(new_answer)
+
+        edited_sentences = self.sent_tok.tokenize(context)
+
+        labels = []
+        for sentence in edited_sentences:
+            for answer in edited_answers:
+                if answer in sentence and sentence not in labels:
+                    labels.append(sentence)
+                    break
+
+        action = {
+            'id': 'SquadSentenceLabels',
+            'text': question,
+            'labels': labels,
+            'label_candidates': edited_sentences,
+            'episode_done': True,
+        }
+
+        return action

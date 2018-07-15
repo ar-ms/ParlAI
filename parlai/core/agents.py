@@ -37,12 +37,14 @@ This module also provides a utility method:
 
 """
 
+from parlai.core.build_data import modelzoo_path
 from .metrics import Metrics, aggregate_metrics
 import copy
 import importlib
 import pickle
 import random
 import os
+
 
 class Agent(object):
     """Base class for all other agents."""
@@ -274,18 +276,27 @@ def name_to_agent_class(name):
     class_name += 'Agent'
     return class_name
 
+
 def load_agent_module(opt):
     model_file = opt['model_file']
-    optfile =  model_file + '.opt'
+    optfile = model_file + '.opt'
     if os.path.isfile(optfile):
         with open(optfile, 'rb') as handle:
-           new_opt = pickle.load(handle)
+            new_opt = pickle.load(handle)
+        if 'batchindex' in new_opt:
+            # This saved variable can cause trouble if we switch to BS=1 at test time
+            del new_opt['batchindex']
         # only override opts specified in 'override' dict
         if opt.get('override'):
-            for k in opt['override']:
-                v = opt[k]
-                print("[ warning: overriding opt['" + str(k) + "'] to " + str(v) +
-                      " (previously:" + str(str(new_opt.get(k, None))) + ") ]")
+            for k, v in opt['override'].items():
+                if str(v) != str(new_opt.get(k, None)):
+                    print("[ warning: overriding opt['{}'] to {} ("
+                          "previously: {} )]".format(
+                            k, v, new_opt.get(k, None)))
+                new_opt[k] = v
+        # add model arguments to new_opt if they aren't in new_opt already
+        for k, v in opt.items():
+            if k not in new_opt:
                 new_opt[k] = v
         new_opt['model_file'] = model_file
         model_class = get_agent_module(new_opt['model'])
@@ -293,17 +304,24 @@ def load_agent_module(opt):
     else:
         return None
 
+
 def get_agent_module(dir_name):
+    repo = 'parlai'
+    if dir_name.startswith('internal:'):
+        # To switch to local repo, useful for non-public projects
+        # (make a directory called 'parlai_internal' with your private agents)
+        repo = 'parlai_internal'
+        dir_name = dir_name[9:]
     if ':' in dir_name:
         s = dir_name.split(':')
         module_name = s[0]
         class_name = s[1]
     elif '/' in dir_name:
         sp = dir_name.split('/')
-        module_name = "parlai.agents.%s.%s" % (sp[0], sp[1])
+        module_name = "%s.agents.%s.%s" % (repo, sp[0], sp[1])
         class_name = name_to_agent_class(sp[1])
     else:
-        module_name = "parlai.agents.%s.%s" % (dir_name, dir_name)
+        module_name = "%s.agents.%s.%s" % (repo, dir_name, dir_name)
         class_name = name_to_agent_class(dir_name)
     my_module = importlib.import_module(module_name)
     model_class = getattr(my_module, class_name)
@@ -322,7 +340,22 @@ def create_agent(opt, requireModelExists=False):
     the options file if it exists (the file opt['model_file'] + '.opt' must exist and
     contain a pickled dict containing the model's options).
     """
+    if opt.get('datapath', None) is None:
+        # add datapath, it is missing
+        from parlai.core.params import ParlaiParser, get_model_name
+        parser = ParlaiParser(add_parlai_args=False)
+        parser.add_parlai_data_path()
+        # add model args if they are missing
+        model = get_model_name(opt)
+        if model is not None:
+            parser.add_model_subargs(model)
+        opt_parser = parser.parse_args("", print_args=False)
+        for k, v in opt_parser.items():
+            if k not in opt:
+                opt[k] = opt_parser[k]
+
     if opt.get('model_file'):
+        opt['model_file'] = modelzoo_path(opt.get('datapath'), opt['model_file'])
         if requireModelExists and not os.path.isfile(opt['model_file']):
             raise RuntimeError('WARNING: Model file does not exist, check to make '
                                'sure it is correct: {}'.format(opt['model_file']))
@@ -361,14 +394,21 @@ def create_agents_from_shared(shared):
 
 def get_task_module(taskname):
     # get the module of the task agent
-    sp = taskname.strip().split(':')
+    sp = taskname.strip()
+    repo = 'parlai'
+    if sp.startswith('internal:'):
+        # To switch to local repo, useful for non-public projects
+        # (make a directory called 'parlai_internal' with your private agents)
+        repo = 'parlai_internal'
+        sp = sp[9:]
+    sp = sp.split(':')
     if '.' in sp[0]:
         module_name = sp[0]
     elif sp[0] == 'pytorch_teacher':
         module_name = 'parlai.core.pytorch_data_teacher'
     else:
         task = sp[0].lower()
-        module_name = "parlai.tasks.%s.agents" % (task)
+        module_name = "%s.tasks.%s.agents" % (repo, task)
     if len(sp) > 1:
         sp[1] = sp[1][0].upper() + sp[1][1:]
         teacher = sp[1]
@@ -394,9 +434,11 @@ def create_task_agent_from_taskname(opt):
     which essentially performs ``from parlai.tasks.babi import Task1kTeacher``
     with the parameter ``1`` in ``opt['task']`` to be used by the class ``Task1kTeacher``.
     """
-    if not opt.get('task'):
+    if not (opt.get('task') or opt.get('pytorch_teacher_task') or opt.get('pytorch_teacher_dataset')):
         raise RuntimeError('No task specified. Please select a task with ' +
                            '--task {task_name}.')
+    if not opt.get('task'):
+        opt['task'] = 'pytorch_teacher'
     if ',' not in opt['task']:
         # Single task
         teacher_class = get_task_module(opt['task'])
@@ -421,7 +463,14 @@ def _create_task_agents(opt):
     (This saves the task creator bothering to define the
     create_agents function when it is not needed.)
     """
-    sp = opt['task'].strip().split(':')
+    sp = opt['task'].strip()
+    repo = 'parlai'
+    if sp.startswith('internal:'):
+        # To switch to local repo, useful for non-public projects
+        # (make a directory called 'parlai_internal' with your private agents)
+        repo = 'parlai_internal'
+        sp = sp[9:]
+    sp = sp.split(':')
     if '.' in sp[0]:
         # The case of opt['task'] = 'parlai.tasks.squad.agents:DefaultTeacher'
         # (i.e. specifying your own path directly)
@@ -430,7 +479,7 @@ def _create_task_agents(opt):
         module_name = 'parlai.core.pytorch_data_teacher'
     else:
         task = sp[0].lower()
-        module_name = "parlai.tasks.%s.agents" % (task)
+        module_name = "%s.tasks.%s.agents" % (repo, task)
     my_module = importlib.import_module(module_name)
     try:
         # Tries to call the create_agent function in agents.py

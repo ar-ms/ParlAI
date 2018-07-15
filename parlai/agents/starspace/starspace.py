@@ -9,13 +9,12 @@
 
 from parlai.core.agents import Agent
 from parlai.core.dict import DictionaryAgent
-from parlai.core.utils import round_sigfigs, maintain_dialog_history
+from parlai.core.utils import round_sigfigs, maintain_dialog_history, load_cands
 from parlai.core.thread_utils import SharedTable
 
 from .modules import Starspace
 
 import torch
-from torch.autograd import Variable
 import torch.autograd as autograd
 from torch import optim
 import torch.nn as nn
@@ -27,42 +26,6 @@ import os
 import random
 import math
 import pickle
-
-def load_cands(path):
-    """Load global fixed set of candidate labels that the teacher provides
-    every example (the true labels for a specific example are also added to
-    this set, so that it's possible to get the right answer).
-    """
-    if path is None:
-        return None
-    cands = []
-    lines_have_ids = False
-    cands_are_replies = False
-    cnt = 0
-    with open(path) as read:
-        for line in read:
-            line = line.strip().replace('\\n', '\n')
-            if len(line) > 0:
-                cnt = cnt + 1
-                # If lines are numbered we strip them of numbers.
-                if cnt == 1 and line[0:2] == '1 ':
-                    lines_have_ids = True
-                # If tabs then the label_candidates are all the replies.
-                if '\t' in line and not cands_are_replies:
-                    cands_are_replies = True
-                    cands = []
-                if lines_have_ids:
-                    space_idx = line.find(' ')
-                    line = line[space_idx + 1:]
-                    if cands_are_replies:
-                        sp = line.split('\t')
-                        if len(sp) > 1 and sp[1] != '':
-                            cands.append(sp[1])
-                    else:
-                        cands.append(line)
-                else:
-                    cands.append(line)
-    return cands
 
 class StarspaceAgent(Agent):
     """Simple implementation of the starspace algorithm: https://arxiv.org/abs/1709.03856
@@ -145,8 +108,6 @@ class StarspaceAgent(Agent):
         self.debugMode = False
         if shared:
             torch.set_num_threads(1)
-            self.threadindex = shared['threadindex']
-            print("[ creating Starspace thread " + str(self.threadindex)  + " ]")
             # set up shared properties
             self.dict = shared['dict']
             self.model = shared['model']
@@ -173,7 +134,7 @@ class StarspaceAgent(Agent):
             self.fixedCands_txt = load_cands(self.opt.get('fixed_candidates_file'))
             fcs = []
             for c in self.fixedCands_txt:
-                fcs.append(Variable(torch.LongTensor(self.parse(c)).unsqueeze(0)))
+                fcs.append(torch.LongTensor(self.parse(c)).unsqueeze(0))
             self.fixedCands = fcs
             print("[loaded candidates]")
 
@@ -219,12 +180,10 @@ class StarspaceAgent(Agent):
 
     def t2v(self, text):
         p = self.dict.txt2vec(text)
-        return Variable(torch.LongTensor(p).unsqueeze(1))
+        return torch.LongTensor(p).unsqueeze(1)
 
     def v2t(self, vec):
         """Convert token indices to string of tokens."""
-        if isinstance(vec, Variable):
-            vec = vec.data
         new_vec = []
         for i in vec:
             new_vec.append(i)
@@ -243,9 +202,9 @@ class StarspaceAgent(Agent):
         return obs
 
     def same(self, y1, y2):
-        if len(y1.squeeze()) != len(y2.squeeze()):
+        if len(y1.squeeze(0)) != len(y2.squeeze(0)):
             return False
-        if abs((y1.squeeze()-y2.squeeze()).sum().data.sum()) > 0.00001:
+        if abs((y1.squeeze(0)-y2.squeeze(0)).sum().data.sum()) > 0.00001:
             return False
         return True
 
@@ -265,7 +224,7 @@ class StarspaceAgent(Agent):
         if self.opt['parrot_neg'] > 0:
             utt = self.history['last_utterance']
             if len(utt) > 2:
-                query = Variable(torch.LongTensor(utt).unsqueeze(0))
+                query = torch.LongTensor(utt).unsqueeze(0)
                 negs.append(query)
         return negs
 
@@ -314,13 +273,13 @@ class StarspaceAgent(Agent):
                     for c in negs:
                         print("neg: " + self.v2t(c.squeeze()))
                     print("---")
-                y = Variable(-torch.ones(xe.size(0)))
+                y = -torch.ones(xe.size(0))
                 y[0]= 1
                 loss = self.criterion(xe, ye, y)
                 loss.backward()
                 self.optimizer.step()
                 pred = nn.CosineSimilarity().forward(xe,ye)
-                metrics = self.compute_metrics(loss.data[0], pred.data.squeeze())
+                metrics = self.compute_metrics(loss.item(), pred.data.squeeze())
                 return [{'metrics':metrics}]
         else:
             self.model.eval()
@@ -337,7 +296,7 @@ class StarspaceAgent(Agent):
                     self.fixedX = ye
                 else:
                     # fixed candidate embed vectors are cached, dont't recompute
-                    blah = Variable(torch.LongTensor([1]))
+                    blah = torch.LongTensor([1])
                     xe, ye = self.model(xs, ys, [blah])
                     ye = self.fixedX
             else:
@@ -354,7 +313,7 @@ class StarspaceAgent(Agent):
                 tc.append(cands_txt[0][ind.data[i]])
             ret = [{'text': ypred, 'text_candidates': tc }]
             return ret
-        return [{}]
+        return [{'id': self.getID()}]
 
     def vectorize(self, observations):
         """Convert a list of observations into input & target tensors."""
@@ -386,9 +345,8 @@ class StarspaceAgent(Agent):
 
         max_x_len = max([len(x) for x in parsed_x])
         for x in parsed_x:
-            x += [[self.NULL_IDX]] * (max_x_len - len(x))
+            x += [self.NULL_IDX] * (max_x_len - len(x))
         xs = torch.LongTensor(parsed_x)
-        xs = Variable(xs)
 
         # set up the target tensors
         ys = None
@@ -404,7 +362,6 @@ class StarspaceAgent(Agent):
             for y in parsed_y:
                 y += [self.NULL_IDX] * (max_y_len - len(y))
             ys = torch.LongTensor(parsed_y)
-            ys = Variable(ys)
 
         cands = []
         cands_txt = []
@@ -415,7 +372,7 @@ class StarspaceAgent(Agent):
                     cs = []
                     ct = []
                     for c in o['label_candidates']:
-                        cs.append(Variable(torch.LongTensor(self.parse(c)).unsqueeze(0)))
+                        cs.append(torch.LongTensor(self.parse(c)).unsqueeze(0))
                         ct.append(c)
                     cands.append(cs)
                     cands_txt.append(ct)
@@ -436,13 +393,14 @@ class StarspaceAgent(Agent):
     def batch_act(self, observations):
         batchsize = len(observations)
         # initialize a table of replies with this agent's id
-        batch_reply = [{'id': self.getID()} for _ in range(batchsize)]
         # convert the observations into batches of inputs and targets
         # valid_inds tells us the indices of all valid examples
         # e.g. for input [{}, {'text': 'hello'}, {}, {}], valid_inds is [1]
         # since the other three elements had no 'text' field
         xs, ys, cands, cands_txt = self.vectorize(observations)
         batch_reply = self.predict(xs, ys, cands, cands_txt, observations)
+        while len(batch_reply) < batchsize:
+            batch_reply.append({'id': self.getID()})
         self.add_to_ys_cache(ys)
         return batch_reply
 

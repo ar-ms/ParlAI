@@ -1,9 +1,3 @@
-# Copyright (c) 2017-present, Facebook, Inc.
-# All rights reserved.
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree. An additional grant
-# of patent rights can be found in the PATENTS file in the same directory.
-
 from parlai.core.agents import Agent
 from parlai.core.dict import DictionaryAgent
 from parlai.core.utils import PaddingUtils
@@ -19,42 +13,6 @@ import copy
 import pickle
 import pandas as pd
 
-
-def load_cands(path):
-    """Load global fixed set of candidate labels that the teacher provides
-    every example (the true labels for a specific example are also added to
-    this set, so that it's possible to get the right answer).
-    """
-    if path is None:
-        return None
-    cands = []
-    lines_have_ids = False
-    cands_are_replies = False
-    cnt = 0
-    with open(path) as read:
-        for line in read:
-            line = line.strip().replace('\\n', '\n')
-            if len(line) > 0:
-                cnt = cnt + 1
-                # If lines are numbered we strip them of numbers.
-                if cnt == 1 and line[0:2] == '1 ':
-                    lines_have_ids = True
-                # If tabs then the label_candidates are all the replies.
-                if '\t' in line and not cands_are_replies:
-                    cands_are_replies = True
-                    cands = []
-                if lines_have_ids:
-                    space_idx = line.find(' ')
-                    line = line[space_idx + 1:]
-                    if cands_are_replies:
-                        sp = line.split('\t')
-                        if len(sp) > 1 and sp[1] != '':
-                            cands.append(sp[1])
-                    else:
-                        cands.append(line)
-                else:
-                    cands.append(line)
-    return cands
 
 class KVmemNN(nn.Module):
     def __init__(self, vocs, embedding_size=100, n_hops=2):
@@ -133,74 +91,8 @@ class KVmemNN(nn.Module):
 
         preds = self.cosine(q_plus_plus.expand_as(encoded_candidates),
                             encoded_candidates)
-        #print(preds)
-        return preds
-
-        q = self.shared_emb(x).mean(1).view(self.embedding_size)
-        first_hop_sum = 0
-        for pi in encoded_persona:
-            #print('q:', q.size(), 'pi:', pi.size())
-            si = self.softmax(self.cosine(q, pi))
-            print('si:', si, si.size())
-            first_hop_sum += si*pi
-
-        q_plus = q + first_hop_sum
-
-        second_hop_sum = 0
-        for ki, vi in zip(encoded_keys, encoded_values):
-            #print('q:', q_plus.size(), 'ki:', ki.size())
-            si = self.softmax(self.cosine(q_plus, ki))
-            #print('si:', si, si.size())
-            second_hop_sum += si*vi
-
-        q_plus_plus = q_plus + first_hop_sum
-        # for ci in encoded_candidates:
-        #     print('q_plus:', q_plus_plus.size(), 'ci:', ci.size())
-        #     print(self.cosine(q_plus_plus, ci))
-
-        preds = F.cosine_similarity(q_plus_plus.expand_as(encoded_candidates),
-                                    encoded_candidates,
-                                    dim=1)
-        #print(preds)
 
         return preds
-
-        encoded_keys = torch.stack(encoded_keys)
-        encoded_values = torch.stack(encoded_values)
-        encoded_candidates = torch.stack(encoded_candidates)
-        encoded_persona = torch.stack(encoded_persona)
-        encoded_questions = torch.stack(encoded_xs).view(-1, self.embedding_size)
-
-        x = torch.tensor(xs, dtype=torch.long)
-        encoded_question = self.shared_emb(x).mean(1).view(-1, self.embedding_size)
-        q = encoded_question
-
-        sim = self.cosine(encoded_questions, encoded_persona)
-        softSim = self.softmax(sim)
-        test = torch.mm(softSim.view(1, -1), encoded_persona)
-        q = q + self.R(test)
-
-        tmp = torch.mm(encoded_keys, q.view(-1, 1))
-        ph = self.softmax(tmp)
-        #eprint("ph:",ph.size())
-        test = torch.mm(ph.view(1, -1), encoded_values)
-        #o = torch.sum(ph*encoded_values)
-        #eprint("o:", o.size())
-        #eprint("*"*50)
-        #q = self.R[0] * (q+o)
-        q = q + self.R(test)
-
-
-        preds = torch.mm(encoded_candidates, q.view(-1, 1))
-        #preds = q*encoded_cands
-        #eprint("preds:", preds.size())
-        #preds = F.softmax(preds, dim=0)
-        preds = self.softmax(preds)
-
-        #print(preds)
-        #print(preds.argmax())
-        return preds
-    #return (encoded_candidates[preds.argmax()], encoded_candidates[-1])
 
 
 class ArmsAgent(Agent):
@@ -254,7 +146,8 @@ class ArmsAgent(Agent):
 
             print('[*] Info: loading dialog file...')
             self.dialogs_df = pd.read_csv('/home/arms/dialog.csv')
-            all_cands = self.dialogs_df['values'].tolist()#self.dialogs_df['keys'].tolist() + self.dialogs_df['values'].tolist()
+            all_cands = self.dialogs_df['values'].tolist()
+            #self.dialogs_df['keys'].tolist() + self.dialogs_df['values'].tolist()
             self.all_cands = [self.dict.txt2vec(cand) for cand in all_cands]
             print('[*] Info: cands ready...')
 

@@ -11,6 +11,7 @@ import pickle
 import threading
 import time
 import uuid
+import errno
 
 from botocore.exceptions import ClientError
 
@@ -24,19 +25,24 @@ import parlai.mturk.core.shared_utils as shared_utils
 
 # Timeout before cancelling a world start
 WORLD_START_TIMEOUT = 11
-HEARTBEAT_DELAY_TIME = WORLD_START_TIMEOUT - SocketManager.DEF_SOCKET_TIMEOUT
 
 # Multiplier to apply when creating hits to ensure worker availibility
 HIT_MULT = 1.5
 
 # Max number of conversation disconnects before a turker should be blocked
-MAX_DISCONNECTS = 5
+MAX_DISCONNECTS = 30
 
 # Time to persist a disconnect before forgetting about it. Combined with the
-# above this will block workers that disconnect at least 25 times in a week
-DISCONNECT_PERSIST_LENGTH = 60 * 24 * 7
+# above this will block workers that disconnect at least 30 times in a day
+DISCONNECT_PERSIST_LENGTH = 60 * 60 * 24
+
+# 6 minute timeout to ensure only one thread updates the time logs.
+# Those update once daily in a 3 minute window
+RESET_TIME_LOG_TIMEOUT = 360
 
 DISCONNECT_FILE_NAME = 'disconnects.pickle'
+TIME_LOGS_FILE_NAME = 'working_time.pickle'
+TIME_LOGS_FILE_LOCK = 'working_time.lock'
 
 AMAZON_SNS_NAME = 'AmazonMTurk'
 SNS_ASSIGN_ABANDONDED = 'AssignmentAbandoned'
@@ -45,6 +51,28 @@ SNS_ASSIGN_RETURNED = 'AssignmentReturned'
 
 
 parent_dir = os.path.dirname(os.path.abspath(__file__))
+
+
+class LockFile():
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+
+    def __init__(self, filename):
+        self.filename = filename
+        self.fd = None
+
+    def __enter__(self):
+        while self.fd is None:
+            try:
+                self.fd = os.open(self.filename, self.flags)
+            except OSError as e:
+                if e.errno == errno.EEXIST:  # Failed as the file exists.
+                    pass
+            time.sleep(shared_utils.THREAD_SHORT_SLEEP)
+        return self
+
+    def __exit__(self, *args):
+        os.close(self.fd)
+        os.remove(self.filename)
 
 
 class MTurkManager():
@@ -56,6 +84,13 @@ class MTurkManager():
         """Create an MTurkManager using the given setup opts and a list of
         agent_ids that will participate in each conversation
         """
+        try:
+            import parlai_internal.mturk.configs as local_configs
+            opt = local_configs.apply_default_opts(opt)
+        except Exception:
+            # not all users will be drawing configs from internal settings
+            pass
+
         self.opt = opt
         if self.opt['unique_worker'] or \
                 self.opt['unique_qual_name'] is not None:
@@ -76,6 +111,7 @@ class MTurkManager():
         )
         self.minimum_messages = opt.get('min_messages', 0)
         self.auto_approve_delay = opt.get('auto_approve_delay', 4*7*24*3600)
+        self.has_time_limit = opt.get('max_time', 0) > 0
         self.socket_manager = None
         self.is_test = is_test
         self.is_unique = False
@@ -96,13 +132,66 @@ class MTurkManager():
         self.conv_to_agent = {}
         self.accepting_workers = True
         self._load_disconnects()
+        self._reset_time_logs(init_load=True)
         self.assignment_to_worker_id = {}
         self.qualifications = None
+        self.time_limit_checked = time.time()
+        self.time_blocked_workers = []
 
     def _init_logs(self):
         """Initialize logging settings from the opt"""
         shared_utils.set_is_debug(self.opt['is_debug'])
         shared_utils.set_log_level(self.opt['log_level'])
+
+    def _reset_time_logs(self, init_load=False, force=False):
+        # Uses a weak lock file to try to prevent clobbering between threads
+        file_path = os.path.join(parent_dir, TIME_LOGS_FILE_NAME)
+        file_lock = os.path.join(parent_dir, TIME_LOGS_FILE_LOCK)
+        with LockFile(file_lock) as _lock_file:
+            assert _lock_file is not None
+            if os.path.exists(file_path):
+                with open(file_path, 'rb+') as time_log_file:
+                    existing_times = pickle.load(time_log_file)
+                    # Initial loads should only reset if it's been a day,
+                    # otherwise only need to check an hour for safety
+                    compare_time = 24 * 60 * 60 if init_load else 60 * 60
+                    if time.time() - existing_times['last_reset'] < \
+                            24 * 60 * 60 and not force:
+                        return  # do nothing if it's been less than a day
+                    reset_workers = list(existing_times.keys())
+                    reset_workers.remove('last_reset')
+                    self._free_time_blocked_workers(reset_workers)
+
+                # Reset the time logs
+                os.remove(file_path)
+            # new time logs
+            with open(file_path, 'wb+') as time_log_file:
+                time_logs = {'last_reset': time.time()}
+                pickle.dump(time_logs, time_log_file,
+                            pickle.HIGHEST_PROTOCOL)
+
+    def _log_working_time(self, mturk_worker):
+        additional_time = time.time() - mturk_worker.creation_time
+        worker_id = mturk_worker.worker_id
+        file_path = os.path.join(parent_dir, TIME_LOGS_FILE_NAME)
+        file_lock = os.path.join(parent_dir, TIME_LOGS_FILE_LOCK)
+        with LockFile(file_lock) as _lock_file:
+            assert _lock_file is not None
+            if not os.path.exists(file_path):
+                self._reset_time_logs()
+            with open(file_path, 'rb+') as time_log_file:
+                existing_times = pickle.load(time_log_file)
+                total_work_time = existing_times.get(worker_id, 0)
+                total_work_time += additional_time
+                existing_times[worker_id] = total_work_time
+            os.remove(file_path)
+            with open(file_path, 'wb+') as time_log_file:
+                pickle.dump(existing_times, time_log_file,
+                            pickle.HIGHEST_PROTOCOL)
+
+        if total_work_time > int(self.opt.get('max_time')):
+            self.time_blocked_workers.append(worker_id)
+            self.soft_block_worker(worker_id, 'max_time_qual')
 
     def _load_disconnects(self):
         """Load disconnects from file, populate the disconnects field for any
@@ -163,8 +252,9 @@ class MTurkManager():
                         ),
                         True
                     )
-                elif self.opt['block_qualification'] != '':
-                    self.soft_block_worker(worker_id)
+                elif self.opt['disconnect_qualification'] is not None:
+                    self.soft_block_worker(worker_id,
+                                           'disconnect_qualification')
                     shared_utils.print_and_log(
                         logging.INFO,
                         'Worker {} soft blocked - too many disconnects'.format(
@@ -598,10 +688,6 @@ class MTurkManager():
         if agent.state.status != AssignState.STATUS_IN_TASK:
             # Avoid on a second ack if alive already came through
             agent.state.status = AssignState.STATUS_ASSIGNED
-            self.socket_manager.delay_heartbeat_until(
-                agent.get_connection_id(),
-                time.time() + HEARTBEAT_DELAY_TIME
-            )
 
         agent.conversation_id = conv_id
         if conv_id not in self.conv_to_agent:
@@ -640,6 +726,23 @@ class MTurkManager():
                 assignment_id
             )
         )
+
+    def _free_time_blocked_workers(self, workers=None):
+        if workers is None:
+            workers = self.time_blocked_workers
+            self.time_blocked_workers = []
+        for worker_id in workers:
+            self.un_soft_block_worker(worker_id, 'max_time_qual')
+
+    def _check_time_limit(self):
+        if time.time() - self.time_limit_checked < RESET_TIME_LOG_TIMEOUT:
+            return
+        if int(time.time()) % (60*60*24) > 180:
+            # sync the time resets to ONCE DAILY in a 3 minute window
+            return
+        self.time_limit_checked = time.time()
+        self._reset_time_logs()
+        self._free_time_blocked_workers()
 
     # Manager Lifecycle Functions #
 
@@ -895,7 +998,7 @@ class MTurkManager():
             # Count if it's a completed conversation
             if self._no_workers_incomplete(workers):
                 self.completed_conversations += 1
-            if self.opt['max_connections'] != 0:  # If using a conv cap
+            if self.opt['max_connections'] > 0:  # If using a conv cap
                 if self.accepting_workers:  # if still looking for new workers
                     for w in workers:
                         if w.state.status in [
@@ -904,6 +1007,8 @@ class MTurkManager():
                             self.create_additional_hits(1)
 
         while True:
+            if self.has_time_limit:
+                self._check_time_limit()
             # Loop forever starting task worlds until desired convos are had
             with self.worker_pool_change_condition:
                 valid_workers = self._get_unique_pool(eligibility_function)
@@ -975,6 +1080,7 @@ class MTurkManager():
             if self.opt['unique_worker']:
                 mturk_utils.delete_qualification(self.unique_qual_id,
                                                  self.is_sandbox)
+            self._free_time_blocked_workers()
             self._save_disconnects()
 
     # MTurk Agent Interaction Functions #
@@ -1092,6 +1198,8 @@ class MTurkManager():
                 )
             if not worker.state.is_final():
                 worker.state.status = AssignState.STATUS_DONE
+            if self.has_time_limit:
+                self._log_working_time(worker)
 
     def free_workers(self, workers):
         """End completed worker threads"""
@@ -1125,18 +1233,67 @@ class MTurkManager():
         if qualifications is None:
             qualifications = []
 
-        # Add the soft block qualification if it has been specified
-        if self.opt['block_qualification'] != '':
+        if not self.is_sandbox:
+            try:
+                import parlai_internal.mturk.configs as local_configs
+                qualifications = \
+                    local_configs.set_default_qualifications(qualifications)
+            except Exception:
+                # not all users will be drawing configs from internal settings
+                pass
+
+        if self.opt['disconnect_qualification'] is not None:
             block_qual_id = mturk_utils.find_or_create_qualification(
-                self.opt['block_qualification'],
+                self.opt['disconnect_qualification'],
                 'A soft ban from using a ParlAI-created HIT due to frequent '
                 'disconnects from conversations, leading to negative '
                 'experiences for other Turkers and for the requester.',
                 self.is_sandbox,
             )
             assert block_qual_id is not None, (
+                'Hits could not be created as disconnect qualification could '
+                'not be acquired. Shutting down server.'
+            )
+            qualifications.append({
+                'QualificationTypeId': block_qual_id,
+                'Comparator': 'DoesNotExist',
+                'RequiredToPreview': True
+            })
+
+        # Add the soft block qualification if it has been specified
+        if self.opt['block_qualification'] is not None:
+            block_qual_id = mturk_utils.find_or_create_qualification(
+                self.opt['block_qualification'],
+                'A soft ban from this ParlAI-created HIT at the requesters '
+                'discretion. Generally used to restrict how frequently a '
+                'particular worker can work on a particular task.',
+                self.is_sandbox,
+            )
+            assert block_qual_id is not None, (
                 'Hits could not be created as block qualification could not be'
                 ' acquired. Shutting down server.'
+            )
+            qualifications.append({
+                'QualificationTypeId': block_qual_id,
+                'Comparator': 'DoesNotExist',
+                'RequiredToPreview': True
+            })
+
+        if self.has_time_limit:
+            block_qual_name = '{}-max-daily-time'.format(self.task_group_id)
+            if self.opt['max_time_qual'] is not None:
+                block_qual_name = self.opt['max_time_qual']
+            self.max_time_qual = block_qual_name
+            block_qual_id = mturk_utils.find_or_create_qualification(
+                block_qual_name,
+                'A soft ban from working on this HIT or HITs by this '
+                'requester based on a maximum amount of daily work time set '
+                'by the requester.',
+                self.is_sandbox,
+            )
+            assert block_qual_id is not None, (
+                'Hits could not be created as a time block qualification could'
+                ' not be acquired. Shutting down server.'
             )
             qualifications.append({
                 'QualificationTypeId': block_qual_id,
@@ -1306,11 +1463,20 @@ class MTurkManager():
             ''.format(worker_id, reason),
         )
 
-    def soft_block_worker(self, worker_id):
+    def soft_block_worker(self, worker_id, qual='block_qualification'):
         """Soft block a worker by giving the worker the block qualification"""
-        qual_name = self.opt['block_qualification']
-        assert qual_name != '', ('No block qualification has been specified')
+        qual_name = self.opt.get(qual, None)
+        assert qual_name is not None, ('No qualification {} has been specified'
+                                       ''.format(qual))
         self.give_worker_qualification(worker_id, qual_name)
+
+    def un_soft_block_worker(self, worker_id, qual='block_qualification'):
+        """Remove a soft block from a worker by removing a block qualification
+            from the worker"""
+        qual_name = self.opt.get(qual, None)
+        assert qual_name is not None, ('No qualification {} has been specified'
+                                       ''.format(qual))
+        self.remove_worker_qualification(worker_id, qual_name)
 
     def give_worker_qualification(self, worker_id, qual_name, qual_value=None):
         """Give a worker a particular qualification"""
@@ -1331,6 +1497,36 @@ class MTurkManager():
             'gave {} qualification {}'.format(worker_id, qual_name),
             should_print=True
         )
+
+    def remove_worker_qualification(self, worker_id, qual_name, reason=''):
+        """Remove a qualification from a worker"""
+        qual_id = mturk_utils.find_qualification(qual_name, self.is_sandbox)
+        if qual_id is False or qual_id is None:
+            shared_utils.print_and_log(
+                logging.WARN,
+                'Could not remove from worker {} qualification {}, as the '
+                'qualification could not be found to exist.'
+                ''.format(worker_id, qual_name),
+                should_print=True
+            )
+            return
+        try:
+            mturk_utils.remove_worker_qualification(worker_id, qual_id,
+                                                    self.is_sandbox, reason)
+            shared_utils.print_and_log(
+                logging.INFO,
+                'removed {}\'s qualification {}'.format(worker_id, qual_name),
+                should_print=True
+            )
+        except Exception as e:
+            shared_utils.print_and_log(
+                logging.WARN if not self.has_time_limit else logging.INFO,
+                'removing {}\'s qualification {} failed with error {}. This '
+                'can be because the worker didn\'t have that qualification.'
+                ''.format(worker_id, qual_name, repr(e)),
+                should_print=True
+            )
+
 
     def create_qualification(self, qualification_name, description,
                              can_exist=True):

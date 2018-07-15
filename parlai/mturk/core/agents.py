@@ -19,6 +19,8 @@ MTURK_DISCONNECT_MESSAGE = '[DISCONNECT]'  # Turker disconnected from conv
 TIMEOUT_MESSAGE = '[TIMEOUT]'  # the Turker did not respond but didn't return
 RETURN_MESSAGE = '[RETURNED]'  # the Turker returned the HIT
 
+# TODO move time management into another class, this way we can handle it
+# relative to heartbeats. This will come with more thorough testing.
 
 class MTurkAgent(Agent):
     """Base class for an MTurkAgent that can act in a ParlAI world"""
@@ -48,6 +50,7 @@ class MTurkAgent(Agent):
         self.task_group_id = manager.task_group_id
         self.message_request_time = None
         self.recieved_packets = {}
+        self.creation_time = time.time()
 
         self.msg_queue = Queue()
 

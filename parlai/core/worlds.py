@@ -102,7 +102,9 @@ class World(object):
         if not hasattr(self, 'acts'):
             return ''
         return display_messages(self.acts,
-                                prettify=self.opt.get('display_prettify', False))
+                                ignore_fields=self.opt.get('display_ignore_fields', ''),
+                                prettify=self.opt.get('display_prettify', False),
+                                max_len=self.opt.get('max_display_len', 1000))
 
     def episode_done(self):
         """Whether the episode is done or not."""
@@ -203,7 +205,7 @@ class World(object):
             else:
                 self.max_exs = -1
         # when we know the size of the data
-        if self.max_exs > 0:
+        if self.max_exs > 0 or self.num_examples():
             self.total_epochs = self.total_parleys * self.opt.get('batchsize', 1) / self.num_examples()
         # when we do not know the size of the data
         else:
@@ -253,6 +255,12 @@ class DialogPartnerWorld(World):
         return self.agents[0].epoch_done()
 
     def report(self, compute_time=False):
+        def show(metric):
+            if 'all' in self.show_metrics or metric in self.show_metrics or metric=='exs':
+                return True
+            return False
+        show_metrics = self.opt.get('metrics', "all")
+        self.show_metrics = show_metrics.split(',')
         metrics = {}
         for a in self.agents:
             if hasattr(a, 'report'):
@@ -261,19 +269,24 @@ class DialogPartnerWorld(World):
                     if k not in metrics:
                         # first agent gets priority in settings values for keys
                         # this way model can't e.g. override accuracy to 100%
-                        metrics[k] = v
+                        if show(k):
+                            metrics[k] = v
         if metrics:
-            if compute_time and 'total' in metrics:
-                self.total_exs += metrics['total']
+            if compute_time and 'exs' in metrics:
+                self.total_exs += metrics['exs']
                 time_metrics = compute_time_metrics(self, self.opt['max_train_time'])
                 metrics.update(time_metrics)
             return metrics
 
     def num_examples(self):
-        return self.agents[0].num_examples()
+        if hasattr(self.agents[0], 'num_examples'):
+            return self.agents[0].num_examples()
+        return 0
 
     def num_episodes(self):
-        return self.agents[0].num_episodes()
+        if hasattr(self.agents[0], 'num_episodes'):
+            return self.agents[0].num_episodes()
+        return 0
 
     def shutdown(self):
         """Shutdown each agent."""
@@ -333,8 +346,8 @@ class MultiAgentDialogWorld(World):
                         # this way model can't e.g. override accuracy to 100%
                         metrics[k] = v
         if metrics:
-            if compute_time and 'total' in metrics:
-                self.total_exs += metrics['total']
+            if compute_time and 'exs' in metrics:
+                self.total_exs += metrics['exs']
                 time_metrics = compute_time_metrics(self, self.opt['max_train_time'])
                 metrics.update(time_metrics)
             return metrics
@@ -498,7 +511,7 @@ class MultiWorld(World):
     def report(self, compute_time=False):
         metrics = aggregate_metrics(self.worlds)
         if compute_time:
-            self.total_exs += metrics['total']
+            self.total_exs += metrics['exs']
             time_metrics = compute_time_metrics(self, self.opt['max_train_time'])
             metrics.update(time_metrics)
         return metrics
@@ -526,11 +539,11 @@ def override_opts_in_shared(table, overrides):
             table['opt'][k] = v
     for k, v in table.items():
         # look for sub-dictionaries which also might contain an 'opt' dict
-        if type(v) == dict and k != 'opt':
+        if type(v) == dict and k != 'opt' and 'opt' in v:
             override_opts_in_shared(v, overrides)
         elif type(v) == list:
             for item in v:
-                if type(item) == dict:
+                if type(item) == dict and 'opt' in item:
                     # if this is a list of agent shared dicts, we want to iterate
                     override_opts_in_shared(item, overrides)
                 else:
@@ -552,12 +565,16 @@ class BatchWorld(World):
         self.opt = opt
         self.random = opt.get('datatype', None) == 'train'
         self.world = world
-        shared = world.share()
         self.worlds = []
         for i in range(opt['batchsize']):
             # make sure that any opt dicts in shared have batchindex set to i
             # this lets all shared agents know which batchindex they have,
             # which is needed for ordered data (esp valid/test sets)
+            shared = world.share()
+            shared['batchindex'] = i
+            for agent_shared in shared.get('agents', ''):
+                agent_shared['batchindex'] = i
+            # TODO: deprecate override_opts
             override_opts_in_shared(shared, {'batchindex': i})
             self.worlds.append(shared['world_class'](opt, None, shared))
         self.batch_observations = [None] * len(self.world.get_agents())
@@ -611,16 +628,16 @@ class BatchWorld(World):
         num_agents = len(self.world.get_agents())
         batch_observations = self.batch_observations
 
-        for w in self.worlds:
-            if hasattr(w, 'parley_init'):
+        if hasattr(self.world, 'parley_init'):
+            for w in self.worlds:
                 w.parley_init()
 
         for agent_idx in range(num_agents):
             # The agent acts.
             batch_act = self.batch_act(agent_idx, batch_observations[agent_idx])
             # We possibly execute this action in the world.
-            for i, w in enumerate(self.worlds):
-                if hasattr(w, 'execute'):
+            if hasattr(self.world, 'execute'):
+                for i, w in enumerate(self.worlds):
                     w.execute(w.agents[i], batch_act[i])
             # All agents (might) observe the results.
             for other_index in range(num_agents):
@@ -642,6 +659,9 @@ class BatchWorld(World):
 
     def num_episodes(self):
         return self.world.num_episodes()
+
+    def get_total_exs(self):
+        return self.world.get_total_exs()
 
     def getID(self):
         return self.world.getID()
@@ -832,6 +852,9 @@ class HogwildWorld(World):
     def num_episodes(self):
         return self.inner_world.num_episodes()
 
+    def get_total_exs(self):
+        return self.inner_world.get_total_exs()
+
     def get_total_epochs(self):
         """Return total amount of epochs on which the world has trained."""
         if self.max_exs is None:
@@ -933,9 +956,11 @@ def create_task(opt, user_agents, default_world=None):
     see ``parlai/tasks/tasks.py`` and see ``parlai/tasks/task_list.py``
     for list of tasks.
     """
-    if not opt.get('task'):
+    if not (opt.get('task') or opt.get('pytorch_teacher_task') or opt.get('pytorch_teacher_dataset')):
         raise RuntimeError('No task specified. Please select a task with ' +
                            '--task {task_name}.')
+    if not opt.get('task'):
+        opt['task'] = 'pytorch_teacher'
     if type(user_agents) != list:
         user_agents = [user_agents]
 

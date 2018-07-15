@@ -15,19 +15,16 @@ from parlai.scripts.interactive import interactive
 if __name__ == '__main__':
     parser = ParlaiParser(add_model_args=True)
     parser.add_argument('-d', '--display-examples', type='bool', default=False)
-    parser.set_defaults(
+    parser.set_params(
         model='projects.personachat.kvmemnn.arms:ArmsAgent',
         model_file='/tmp/persona_self_original.checkpoint',
-        #model='projects.personachat.kvmemnn.kvmemnn:Kvmemnn',
+        #model='projects.personachat.kvmemnn.kvmemnn:KvmemnnAgent',
         #model_file='models:convai2/kvmemnn/model',
+        interactive_mode=True,
     )
     opt = parser.parse_args()
     # build all profile memory models
     fnames = ['kvmemnn.tgz']
-    opt['model_type'] = 'kvmemnn' # for builder
+    opt['model_type'] = 'kvmemnn'  # for builder
     download_models(opt, fnames, 'convai2')
-
-    # add additional model args
-    opt['override'] = ['interactive_mode']
-    opt['interactive_mode'] = True
     interactive(opt)
